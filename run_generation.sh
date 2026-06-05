@@ -1,9 +1,17 @@
+#!/bin/bash
+# Server launch + data generation for DFlash — only the steps with shell metachars
+# (& ; ") that are awkward to quote in YAML. Deps / clone / seed data stay in the job
+# YAML's setupCommands. Run this from INSIDE the SpecForge dir (the YAML cd's there
+# before calling it; this script inherits that cwd, so the relative paths below work).
 set -e
 
 MODEL_PATH=/gpfs/zwang33/models/Qwen3-8B
 OUT_PATH=/gpfs/zwang33/dflash_data/perfectblend_qwen3-8b_regen.jsonl
 PORT=30000
 DP_SIZE=8
+
+# --- seed data: 2000 samples ---
+python scripts/prepare_data.py --dataset perfectblend --sample-size 2000
 
 # --- launch sglang server in background ---
 python -m sglang.launch_server \
