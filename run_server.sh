@@ -1,0 +1,1 @@
+python -m sglang.launch_server --model-path /gpfs/zwang33/models/Qwen3-8B --served-model-name Qwen/Qwen3-8B --dtype bfloat16 --dp-size 8 --tp-size 1 --mem-fraction-static 0.85 --reasoning-parser qwen3 --host 0.0.0.0 --port 30000 --trust-remote-code
