@@ -27,7 +27,7 @@ python scripts/regenerate_train_data.py \
     --input-file-path /data/jiapingW/pr/SpecForge/cache/dataset/opc_train_first_turn.jsonl \
     --output-file-path ./cache/dataset/opc_train_regen_first_turn.jsonl \
     --resume \
-    --reasoning save
+    --is-reasoning-model
 """
 
 import argparse
@@ -51,13 +51,9 @@ def parse_arguments():
     model_group = parser.add_argument_group("model")
     model_group.add_argument("--model", type=str, required=True)
     model_group.add_argument(
-        "--reasoning",
-        choices=["none", "save", "disable"],
-        default="none",
-        help=(
-            "Reasoning mode: 'none' for standard models, 'save' to store "
-            "reasoning_content, or 'disable' to disable thinking via extra_body"
-        ),
+        "--is-reasoning-model",
+        action="store_true",
+        help="Whether the model is a reasoning model",
     )
     model_group.add_argument(
         "--is-gpt-oss",
@@ -188,8 +184,6 @@ def build_query_kwargs(args, messages, max_tokens=None):
     extra_body = {}
     if args.top_k is not None:
         extra_body["top_k"] = args.top_k
-    if args.reasoning == "disable":
-        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
     if extra_body:
         query_kwargs["extra_body"] = extra_body
     if args.is_gpt_oss:
@@ -236,7 +230,7 @@ def call_sglang(
                 "role": "assistant",
                 "content": response_text,
             }
-            if args.reasoning == "save":
+            if args.is_reasoning_model:
                 resp_msg["reasoning_content"] = resp.choices[
                     0
                 ].message.reasoning_content
@@ -460,3 +454,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
