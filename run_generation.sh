@@ -1,14 +1,15 @@
-#!/bin/bash
-# Server launch + data generation for DFlash — only the steps with shell metachars
-# (& ; ") that are awkward to quote in YAML. Deps / clone / seed data stay in the job
-# YAML's setupCommands. Run this from INSIDE the SpecForge dir (the YAML cd's there
-# before calling it; this script inherits that cwd, so the relative paths below work).
 set -e
 
 MODEL_PATH=/gpfs/zwang33/models/Qwen3-8B
 OUT_PATH=/gpfs/zwang33/dflash_data/perfectblend_qwen3-8b_regen.jsonl
 PORT=30000
 DP_SIZE=8
+
+# --- ensure model is on /gpfs (downloads once on first run, then persists on the PVC) ---
+if [ ! -d "$MODEL_PATH" ]; then
+  echo "Model not found at $MODEL_PATH — downloading Qwen/Qwen3-8B ..."
+  python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-8B', local_dir='$MODEL_PATH')"
+fi
 
 # --- seed data: 2000 samples ---
 python scripts/prepare_data.py --dataset perfectblend --sample-size 2000
@@ -36,3 +37,4 @@ python scripts/regenerate_train_data.py \
   --output-file-path "$OUT_PATH"
 
 echo "DONE: wrote $OUT_PATH"
+
