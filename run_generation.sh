@@ -12,7 +12,7 @@ if [ ! -d "$MODEL_PATH" ]; then
 fi
 
 # --- seed data: 2000 samples ---
-python scripts/prepare_data.py --dataset perfectblend --sample-size 2000
+python scripts/prepare_data.py --dataset perfectblend
 
 # --- launch sglang server in background ---
 python -m sglang.launch_server \
