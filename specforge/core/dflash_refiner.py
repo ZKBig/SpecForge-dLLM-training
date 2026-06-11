@@ -1,0 +1,429 @@
+# coding=utf-8
+"""AR refiner on top of a frozen DFlash drafter.
+
+This module is fully SEPARATE from the DFlash training code (`dflash.py`) — it only
+*imports* and *reuses* it, never modifies it. The refiner consumes the frozen drafter's
+per-block hidden states and autoregressively re-predicts the block, conditioned on the
+previously (teacher-forced / generated) token.
+"""
+
+from dataclasses import dataclass
+from typing import Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3MLP,
+    Qwen3RMSNorm,
+    Qwen3RotaryEmbedding,
+)
+
+from specforge.core.dflash import (
+    OnlineDFlashModel,
+    create_dflash_block_mask,
+    create_dflash_sdpa_mask,
+)
+from specforge.modeling.draft.dflash import apply_rotary_pos_emb
+
+
+@dataclass
+class BlockFeatures:
+    """Intermediate products of the DFlash parallel forward, exposed for the refiner.
+
+    B = batch, n = blocks per seq, block = block_size, H = hidden, V = vocab.
+    """
+
+    output_hidden: torch.Tensor  # (B, n*block, H)  drafter per-position hidden = h[k]
+    target_ids: torch.Tensor  # (B, n, block)    real token at anchor+k ([:,:,0]=anchor)
+    binary_mask: torch.Tensor  # (B, n, block)   0/1 validity (excl. anchor/OOB/non-asst/pad)
+    anchor_positions: torch.Tensor  # (B, n)     absolute anchor index per block
+    block_keep_mask: torch.Tensor  # (B, n)      which blocks are real (not padding)
+    seq_len: int
+
+
+class DFlashFeatureExtractor(OnlineDFlashModel):
+    """A thin subclass of OnlineDFlashModel that exposes the parallel-pass intermediates.
+
+    Inherits all the DFlash helpers (_sample_anchor_positions, _create_noise_embed,
+    _create_position_ids, draft_model, lm_head, embed_tokens). `compute_block_features`
+    is the body of OnlineDFlashModel.forward up to (but excluding) the loss reduction —
+    numerically identical, just returns the tensors instead of a scalar loss.
+    """
+
+    @torch.no_grad()
+    def compute_block_features(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> BlockFeatures:
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
+        anchor_positions, block_keep_mask = self._sample_anchor_positions(
+            seq_len, loss_mask, device
+        )
+        n_blocks = anchor_positions.size(1)
+
+        noise_embedding = self._create_noise_embed(
+            input_ids, anchor_positions, block_keep_mask
+        )
+
+        context_position_ids = (
+            torch.arange(seq_len, device=device).unsqueeze(0).expand(bsz, -1)
+        )
+        draft_position_ids = self._create_position_ids(anchor_positions)
+        full_position_ids = torch.cat([context_position_ids, draft_position_ids], dim=1)
+
+        if self.attention_backend == "flex_attention":
+            dflash_attn_mask = create_dflash_block_mask(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                S=seq_len,
+                block_size=self.block_size,
+                device=device,
+            )
+        else:
+            dflash_attn_mask = create_dflash_sdpa_mask(
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                S=seq_len,
+                block_size=self.block_size,
+                device=device,
+            )
+
+        # drafter per-position hidden states (the refiner's h[k])
+        output_hidden = self.draft_model(
+            position_ids=full_position_ids,
+            noise_embedding=noise_embedding,
+            target_hidden=hidden_states,
+            attention_mask=dflash_attn_mask,
+        )
+
+        # --- same-position labels: position k -> token at anchor+k ---
+        label_offsets = torch.arange(0, self.block_size, device=device).view(1, 1, -1)
+        label_indices = anchor_positions.unsqueeze(-1) + label_offsets
+        valid_label_mask = label_indices < seq_len
+        safe_label_indices = label_indices.clamp(max=seq_len - 1)
+
+        target_ids = torch.gather(
+            input_ids.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+        )
+
+        # --- 0/1 validity mask: real block * in-bounds * exclude anchor(pos 0) * assistant ---
+        binary_mask = block_keep_mask.unsqueeze(-1).expand(-1, -1, self.block_size).float()
+        binary_mask = binary_mask * valid_label_mask.float()
+        pos_in_block = torch.arange(self.block_size, device=device).view(1, 1, -1)
+        binary_mask = binary_mask * (pos_in_block > 0).float()
+        loss_mask_gathered = torch.gather(
+            loss_mask.unsqueeze(1).expand(-1, n_blocks, -1), 2, safe_label_indices
+        )
+        binary_mask = binary_mask * loss_mask_gathered
+
+        return BlockFeatures(
+            output_hidden=output_hidden,
+            target_ids=target_ids,
+            binary_mask=binary_mask,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            seq_len=seq_len,
+        )
+
+
+class RefinerLayer(nn.Module):
+    """One Qwen3-style decoder layer for the refiner.
+
+    Query = the `block` positions. Keys/Values = [window ; block]. The mask makes each
+    block position attend to (a) all valid window tokens and (b) block positions <= k
+    (causal). RoPE positions run 0..(W+block-1) so relative order is correct.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        H = config.hidden_size
+        self.head_dim = getattr(
+            config, "head_dim", H // config.num_attention_heads
+        )
+        self.n_heads = config.num_attention_heads
+        self.n_kv = config.num_key_value_heads
+        self.q_proj = nn.Linear(H, self.n_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(H, self.n_kv * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(H, self.n_kv * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, H, bias=config.attention_bias)
+        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.input_layernorm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
+        self.mlp = Qwen3MLP(config)
+
+    def forward(self, x, win_h, cos, sin, attn_mask):
+        bn, q_len, _ = x.shape
+        residual = x
+        xn = self.input_layernorm(x)
+
+        q = self.q_proj(xn).view(bn, q_len, -1, self.head_dim)
+        q = self.q_norm(q).transpose(1, 2)  # (bn, n_heads, q_len, hd)
+
+        kv_in = xn if win_h is None else torch.cat([win_h, xn], dim=1)
+        kv_len = kv_in.size(1)
+        k = self.k_proj(kv_in).view(bn, kv_len, -1, self.head_dim)
+        k = self.k_norm(k).transpose(1, 2)  # (bn, n_kv, kv_len, hd)
+        v = self.v_proj(kv_in).view(bn, kv_len, -1, self.head_dim).transpose(1, 2)
+
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)  # q uses last q_len of cos
+
+        if self.n_kv != self.n_heads:  # GQA
+            rep = self.n_heads // self.n_kv
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+        attn = attn.transpose(1, 2).reshape(bn, q_len, -1)
+        x = residual + self.o_proj(attn)
+
+        residual = x
+        x = self.post_attention_layernorm(x)
+        x = self.mlp(x)
+        x = residual + x
+        return x
+
+
+class RefinerDecoder(nn.Module):
+    """AR refiner head. Consumes the drafter's per-block hiddens and produces refined
+    hidden states for each block position.
+
+    Inputs (all per (B*n) flattened blocks):
+        h        : (BN, block, H)   drafter hidden h[k]
+        g        : (BN, block, H)   block summary (mean-pooled, broadcast)
+        prev_emb : (BN, block, H)   embedding of t_{k-1} (teacher-forced / generated)
+        window_hidden : (BN, W, ctx_dim) | None   target hiddens of the last W context tokens
+        window_mask   : (BN, W)      | None        1 = valid window token
+
+    window_size = 0 disables the window (pure v1: only h+g+prev + block-causal attn).
+    """
+
+    def __init__(
+        self,
+        config,
+        ctx_dim,
+        window_size: int = 0,
+        num_layers: int = 1,
+        use_residual_gate: bool = False,
+        residual_gate_init: float = 0.0,
+        freeze_residual_gate: bool = False,
+    ):
+        super().__init__()
+        H = config.hidden_size
+        self.window_size = window_size
+        self.use_residual_gate = use_residual_gate
+        self.in_proj = nn.Linear(3 * H, H, bias=False)
+        if window_size > 0:
+            self.window_in_proj = nn.Linear(ctx_dim, H, bias=False)
+            self.window_norm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config)
+        self.layers = nn.ModuleList([RefinerLayer(config) for _ in range(num_layers)])
+        self.norm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
+        # Residual gate: out = h[k] + gate * correction.
+        #   learnable (default): zero-init -> starts == drafter, learns the gate (ReZero).
+        #   frozen: fixed buffer at residual_gate_init (e.g. 1.0 = plain full residual), not trained.
+        if use_residual_gate:
+            gate0 = torch.full((1,), float(residual_gate_init))
+            if freeze_residual_gate:
+                self.register_buffer("residual_gate", gate0)
+            else:
+                self.residual_gate = nn.Parameter(gate0)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        g: torch.Tensor,
+        prev_emb: torch.Tensor,
+        window_hidden: Optional[torch.Tensor] = None,
+        window_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bn, block, _ = h.shape
+        device = h.device
+
+        x = self.in_proj(torch.cat([h, g, prev_emb], dim=-1))  # (BN, block, H)
+
+        win_h = None
+        W = 0
+        if self.window_size > 0 and window_hidden is not None:
+            win_h = self.window_norm(self.window_in_proj(window_hidden))  # (BN, W, H)
+            W = win_h.size(1)
+
+        kv_len = W + block
+        position_ids = torch.arange(kv_len, device=device).unsqueeze(0).expand(bn, -1)
+        cos, sin = self.rotary_emb(x, position_ids)
+
+        # attention mask (BN, 1, block, kv_len), True = attend
+        causal = torch.tril(torch.ones(block, block, dtype=torch.bool, device=device))
+        if W > 0:
+            win_vis = window_mask.bool()[:, None, :].expand(bn, block, W)
+            mask = torch.cat([win_vis, causal[None].expand(bn, block, block)], dim=-1)
+        else:
+            mask = causal[None].expand(bn, block, block)
+        attn_mask = mask[:, None, :, :]
+
+        for layer in self.layers:
+            x = layer(x, win_h, cos, sin, attn_mask)
+        out = self.norm(x)
+        if self.use_residual_gate:
+            # head_in = drafter hidden + gate * correction; gate starts at 0 => == drafter
+            out = h + self.residual_gate * out
+        return out
+
+
+class OnlineDFlashRefiner(nn.Module):
+    """Training wrapper: frozen DFlash drafter + trainable AR refiner.
+
+    forward(input_ids, hidden_states, loss_mask) -> (loss, accuracy).
+    Only `self.refiner` has trainable params; the feature extractor (drafter + target
+    lm_head + embed) is frozen.
+    """
+
+    def __init__(
+        self,
+        feature_extractor: DFlashFeatureExtractor,
+        window_size: int = 0,
+        num_refiner_layers: int = 1,
+        use_residual_gate: bool = False,
+        residual_gate_init: float = 0.0,
+        freeze_residual_gate: bool = False,
+    ):
+        super().__init__()
+        self.feature_extractor = feature_extractor
+        self.block_size = feature_extractor.block_size
+
+        config = feature_extractor.draft_model.config
+        ctx_dim = feature_extractor.draft_model.fc.in_features  # len(target_layer_ids)*H
+        self.refiner = RefinerDecoder(
+            config,
+            ctx_dim,
+            window_size=window_size,
+            num_layers=num_refiner_layers,
+            use_residual_gate=use_residual_gate,
+            residual_gate_init=residual_gate_init,
+            freeze_residual_gate=freeze_residual_gate,
+        )
+
+        # freeze everything except the refiner
+        for p in self.feature_extractor.parameters():
+            p.requires_grad = False
+
+    def _gather_window(self, hidden_states, anchor_positions, seq_len, B, n):
+        """Gather the W target hiddens before each anchor: [a-W, ..., a-1]."""
+        W = self.refiner.window_size
+        device = hidden_states.device
+        ctx_dim = hidden_states.size(-1)
+        offs = torch.arange(W, device=device).view(1, 1, W)
+        widx = anchor_positions.unsqueeze(-1) - W + offs  # (B, n, W) = a-W .. a-1
+        wvalid = widx >= 0  # out-of-bounds (near sequence start) -> masked
+        safe = widx.clamp(0, seq_len - 1)
+        gather_idx = safe.reshape(B, n * W, 1).expand(B, n * W, ctx_dim)
+        window_hidden = torch.gather(hidden_states, 1, gather_idx).view(
+            B, n, W, ctx_dim
+        )
+        return window_hidden.reshape(B * n, W, ctx_dim), wvalid.reshape(B * n, W)
+
+    def forward(self, input_ids, hidden_states, loss_mask):
+        fe = self.feature_extractor
+        f = fe.compute_block_features(input_ids, hidden_states, loss_mask)  # frozen, no_grad
+
+        B = f.output_hidden.size(0)
+        H = f.output_hidden.size(-1)
+        block = self.block_size
+        n = f.output_hidden.size(1) // block
+        BN = B * n
+
+        # h[k], g (mean over the block), prev-token embedding (teacher forcing)
+        h = f.output_hidden.view(B, n, block, H).reshape(BN, block, H)
+        g = h.mean(dim=1, keepdim=True).expand(-1, block, -1)
+
+        tgt = f.target_ids.reshape(BN, block)
+        prev_tok = tgt.roll(shifts=1, dims=1)
+        # slot 0 input = real token at anchor-1 (standard AR shift; no anchor duplication)
+        am1_idx = (f.anchor_positions - 1).clamp(min=0)
+        prev_tok[:, 0] = torch.gather(input_ids, 1, am1_idx).reshape(BN)
+        prev_emb = fe.embed_tokens(prev_tok)
+
+        window_hidden = window_mask = None
+        if self.refiner.window_size > 0:
+            window_hidden, window_mask = self._gather_window(
+                hidden_states, f.anchor_positions, f.seq_len, B, n
+            )
+
+        refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
+        logits = fe.lm_head(refined)  # (BN, block, V)
+
+        flat_logits = logits.reshape(-1, logits.size(-1))
+        flat_tgt = tgt.reshape(-1)
+        weight = f.binary_mask.reshape(-1)
+
+        loss_per = F.cross_entropy(flat_logits, flat_tgt, reduction="none")
+        loss = (loss_per * weight).sum() / (weight.sum() + 1e-6)
+
+        with torch.no_grad():
+            pred = flat_logits.argmax(dim=-1)
+            correct = (pred == flat_tgt) & (weight > 0.5)
+            accuracy = correct.sum().float() / (weight.sum() + 1e-6)
+
+        return loss, accuracy
+
+    @torch.no_grad()
+    def accept_lengths(self, input_ids, hidden_states, loss_mask):
+        """Mean accepted draft length for (refiner, drafter) on the SAME sampled blocks.
+
+        - drafter: frozen DFlash parallel argmax (the baseline the refiner must beat).
+        - refiner: free-running greedy AR (feeds its OWN predictions forward) -> the honest
+          inference proxy, unlike the optimistic teacher-forced training accuracy.
+        Accept length = leading run of block slots (1..L-1) whose argmax matches the
+        ground-truth token (cumprod prefix), averaged over real blocks.
+        """
+        fe = self.feature_extractor
+        f = fe.compute_block_features(input_ids, hidden_states, loss_mask)
+        B = f.output_hidden.size(0)
+        H = f.output_hidden.size(-1)
+        block = self.block_size
+        n = f.output_hidden.size(1) // block
+        BN = B * n
+        device = input_ids.device
+
+        h = f.output_hidden.view(B, n, block, H).reshape(BN, block, H)
+        g = h.mean(dim=1, keepdim=True).expand(-1, block, -1)
+        tgt = f.target_ids.reshape(BN, block)  # [:,0] = real anchor
+
+        anchors = f.anchor_positions.reshape(BN, 1)
+        pos_abs = anchors + torch.arange(block, device=device).view(1, block)
+        valid = pos_abs < f.seq_len  # [BN, block] in-bounds
+        keep = f.block_keep_mask.reshape(BN).float()
+
+        def _accept(pred):
+            match = (pred[:, 1:] == tgt[:, 1:]) & valid[:, 1:]
+            accept = match.float().cumprod(dim=1).sum(dim=1)
+            return (accept * keep).sum() / keep.sum().clamp(min=1.0)
+
+        # drafter baseline: parallel argmax, no AR
+        drafter_pred = fe.lm_head(h).argmax(dim=-1)  # [BN, block]
+        drafter_accept = _accept(drafter_pred)
+
+        # refiner: free-running greedy AR (slot 0 stays the real anchor)
+        window_hidden = window_mask = None
+        if self.refiner.window_size > 0:
+            window_hidden, window_mask = self._gather_window(
+                hidden_states, f.anchor_positions, f.seq_len, B, n
+            )
+        # slot 0 input = real token at anchor-1 (matches forward / version2)
+        am1_idx = (f.anchor_positions - 1).clamp(min=0)
+        tok_am1 = torch.gather(input_ids, 1, am1_idx).reshape(BN)
+        pred = tgt.clone()
+        for k in range(1, block):
+            prev_tok = pred.roll(shifts=1, dims=1)
+            prev_tok[:, 0] = tok_am1
+            prev_emb = fe.embed_tokens(prev_tok)
+            refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
+            pred[:, k] = fe.lm_head(refined[:, k, :]).argmax(dim=-1)
+        refiner_accept = _accept(pred)
+
+        return refiner_accept, drafter_accept
