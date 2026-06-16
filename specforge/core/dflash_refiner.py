@@ -291,10 +291,12 @@ class OnlineDFlashRefiner(nn.Module):
         use_residual_gate: bool = False,
         residual_gate_init: float = 0.0,
         freeze_residual_gate: bool = False,
+        loss_decay_gamma: float = None,
     ):
         super().__init__()
         self.feature_extractor = feature_extractor
         self.block_size = feature_extractor.block_size
+        self.loss_decay_gamma = loss_decay_gamma
 
         config = feature_extractor.draft_model.config
         ctx_dim = feature_extractor.draft_model.fc.in_features  # len(target_layer_ids)*H
@@ -359,15 +361,25 @@ class OnlineDFlashRefiner(nn.Module):
 
         flat_logits = logits.reshape(-1, logits.size(-1))
         flat_tgt = tgt.reshape(-1)
-        weight = f.binary_mask.reshape(-1)
+        valid = f.binary_mask  # (B, n, block) 0/1
+        w = valid
+        if self.loss_decay_gamma:
+            # weight earlier block positions more (prefix acceptance matters most):
+            # weight_k = exp(-(k-1)/gamma)
+            kk = torch.arange(self.block_size, device=valid.device)
+            decay = torch.exp(-(kk - 1).clamp(min=0).float() / self.loss_decay_gamma)
+            w = w * decay.view(1, 1, -1)
+        flat_w = w.reshape(-1)
+        flat_valid = valid.reshape(-1)
 
         loss_per = F.cross_entropy(flat_logits, flat_tgt, reduction="none")
-        loss = (loss_per * weight).sum() / (weight.sum() + 1e-6)
+        loss = (loss_per * flat_w).sum() / (flat_w.sum() + 1e-6)
 
         with torch.no_grad():
+            # accuracy stays over the 0/1 valid mask (not the decayed weight)
             pred = flat_logits.argmax(dim=-1)
-            correct = (pred == flat_tgt) & (weight > 0.5)
-            accuracy = correct.sum().float() / (weight.sum() + 1e-6)
+            correct = (pred == flat_tgt) & (flat_valid > 0.5)
+            accuracy = correct.sum().float() / (flat_valid.sum() + 1e-6)
 
         return loss, accuracy
 
