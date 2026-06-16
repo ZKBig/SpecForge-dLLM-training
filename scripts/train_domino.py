@@ -129,6 +129,21 @@ def parse_args():
         default=0.5,
         help="Fraction of total steps used to decay lambda_base to 0.",
     )
+    training_group.add_argument(
+        "--freeze-drafter",
+        action="store_true",
+        help="Freeze the DFlash backbone (layers/norm/fc); train ONLY the Domino "
+        "head (prefix_gru + embed_proj). Forces lambda_base=0. Use with "
+        "--pretrained-drafter-path to load a trained frozen drafter.",
+    )
+    training_group.add_argument(
+        "--pretrained-drafter-path",
+        type=str,
+        default=None,
+        help="Path/HF-id of a pretrained DFlash drafter to load the backbone from "
+        "before freezing (e.g. z-lab/Qwen3-8B-DFlash-b16). Backbone keys are loaded "
+        "strict=False; the Domino head stays randomly initialized and trainable.",
+    )
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
     output_group.add_argument("--cache-dir", type=str, default="./cache")
@@ -486,6 +501,62 @@ def main():
                 f"Will resume from epoch {resume_state['epoch']}, "
                 f"step {resume_state['global_step']}"
             )
+
+    def _is_head_param(name: str) -> bool:
+        return name.startswith("prefix_gru") or name.startswith("embed_proj")
+
+    # --- Optional: initialize the DFlash backbone from a pretrained drafter (e.g.
+    #     z-lab/Qwen3-8B-DFlash-b16). Works WITH or WITHOUT --freeze-drafter:
+    #       * + --freeze-drafter -> frozen-head ablation (train only the GRU head)
+    #       * - --freeze-drafter -> co-train from a good init (backbone stays trainable)
+    #     The Domino head (prefix_gru/embed_proj) is always left randomly initialized. ---
+    if args.pretrained_drafter_path and not draft_model_last_checkpoint:
+        print_on_rank0(
+            f"[init] Loading pretrained drafter backbone from "
+            f"{args.pretrained_drafter_path}"
+        )
+        loaded_model = DFlashDraftModel.from_pretrained(
+            args.pretrained_drafter_path, torch_dtype=torch.bfloat16
+        )
+        missing, unexpected = draft_model.load_state_dict(
+            loaded_model.state_dict(), strict=False
+        )
+        del loaded_model
+        backbone_missing = [m for m in missing if not _is_head_param(m)]
+        print_on_rank0(
+            f"[init] Loaded backbone. backbone_missing="
+            f"{len(backbone_missing)} (should be 0), "
+            f"head_missing={len(missing) - len(backbone_missing)} "
+            f"(prefix_gru/embed_proj, expected), unexpected={len(unexpected)}"
+        )
+        if backbone_missing:
+            print_on_rank0(
+                f"[init] WARNING: backbone keys NOT loaded: {backbone_missing[:10]}"
+            )
+
+    # --- Frozen-drafter ablation: freeze backbone, train ONLY the Domino head. ---
+    if args.freeze_drafter:
+        n_frozen = n_trainable = 0
+        for name, p in draft_model.named_parameters():
+            if _is_head_param(name):
+                p.requires_grad = True
+                n_trainable += p.numel()
+            else:
+                p.requires_grad = False
+                n_frozen += p.numel()
+        print_on_rank0(
+            f"[freeze] Frozen backbone params: {n_frozen:,} | "
+            f"trainable Domino-head params: {n_trainable:,}"
+        )
+
+        # base_loss only trains the (now frozen) backbone -> forcing lambda_base=0
+        # so the gradient signal is the Domino-corrected final_loss only.
+        if args.lambda_base_start != 0.0:
+            print_on_rank0(
+                f"[freeze] Overriding lambda_base_start "
+                f"{args.lambda_base_start} -> 0.0 (backbone is frozen)."
+            )
+            args.lambda_base_start = 0.0
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model_path)
 
