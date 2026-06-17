@@ -37,6 +37,7 @@ from transformers import AutoTokenizer
 from datasets import load_dataset
 from specforge.args import TrackerArgs
 from specforge.core.dflash_refiner_cotrain import (
+    CoTrainBF16Optimizer,
     CoTrainFeatureExtractor,
     OnlineDFlashRefinerCoTrain,
 )
@@ -105,8 +106,19 @@ def parse_args():
     )
     refiner_group.add_argument(
         "--drafter-lr-scale", type=float, default=1.0,
-        help="(reserved) scale the drafter LR relative to the head; currently a single "
-        "param group is used so both share --learning-rate.",
+        help="Scale the drafter LR relative to the head LR (e.g. 0.1 = drafter learns 10x "
+        "slower). !=1.0 -> a 2-param-group optimizer; =1.0 -> single shared LR.",
+    )
+    refiner_group.add_argument(
+        "--lambda-base-start", type=float, default=1.0,
+        help="Initial weight of base_loss = CE(lm_head(drafter_hidden)) = the drafter's own "
+        "prediction. Anchors the co-trained drafter (Domino's trick) so training doesn't collapse. "
+        "loss=(1-lambda)*refined+lambda*base. Set 0 to disable (pure refiner loss, may diverge).",
+    )
+    refiner_group.add_argument(
+        "--lambda-base-decay-ratio", type=float, default=1.0,
+        help="Fraction of total steps over which lambda_base decays linearly to 0 "
+        "(1.0 = decay across the whole run, Domino default).",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -405,17 +417,31 @@ def main():
     )
     print_with_rank("Initialized FSDP (refiner head + drafter)")
 
-    # single optimizer over both FSDP units (one param group, shared LR/schedule)
-    trainable = nn.ModuleList(
-        [refiner_model.refiner, refiner_model.feature_extractor.draft_model]
-    )
-    optimizer = BF16Optimizer(
-        trainable,
-        lr=args.learning_rate,
-        max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
-        total_steps=total_steps,
-    )
+    # optimizer over both FSDP units. drafter-lr-scale != 1.0 -> 2 param groups
+    # (head at lr, drafter at lr*scale); == 1.0 -> single shared LR.
+    if args.drafter_lr_scale != 1.0:
+        optimizer = CoTrainBF16Optimizer(
+            refiner_model.refiner,
+            refiner_model.feature_extractor.draft_model,
+            lr=args.learning_rate,
+            drafter_lr_scale=args.drafter_lr_scale,
+            max_grad_norm=args.max_grad_norm,
+            warmup_ratio=args.warmup_ratio,
+            total_steps=total_steps,
+        )
+        print_on_rank0(f"Optimizer: 2 groups (head lr={args.learning_rate}, "
+                       f"drafter lr={args.learning_rate * args.drafter_lr_scale})")
+    else:
+        trainable = nn.ModuleList(
+            [refiner_model.refiner, refiner_model.feature_extractor.draft_model]
+        )
+        optimizer = BF16Optimizer(
+            trainable,
+            lr=args.learning_rate,
+            max_grad_norm=args.max_grad_norm,
+            warmup_ratio=args.warmup_ratio,
+            total_steps=total_steps,
+        )
 
     # --- resume (refiner + drafter + optimizer) ---
     start_epoch, global_step = 0, 0
@@ -473,8 +499,13 @@ def main():
             target_output = target_model.generate_dflash_data(input_ids, attention_mask, loss_mask)
             hidden_states = target_output.hidden_states.cuda()
 
+            # base_loss curriculum: lambda_base decays start -> 0 over decay_ratio*total_steps
+            decay_steps = max(1, int(total_steps * args.lambda_base_decay_ratio))
+            lambda_base = max(0.0, args.lambda_base_start * (1.0 - min(global_step / decay_steps, 1.0)))
+
             loss, accuracy = refiner_model(
-                input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask
+                input_ids=input_ids, hidden_states=hidden_states, loss_mask=loss_mask,
+                lambda_base=lambda_base,
             )
             (loss / args.accumulation_steps).backward()
             if global_step % args.accumulation_steps == 0:
@@ -487,6 +518,7 @@ def main():
                 loss_log /= dist.get_world_size()
                 acc_log /= dist.get_world_size()
                 record_metrics(args, loss_log.item(), acc_log.item(), global_step, tracker, optimizer, train_dataloader)
+                tracker.log({"train/lambda_base": lambda_base}, step=global_step)
 
             if eval_dataloader is not None and global_step % args.eval_interval == 0:
                 refiner_model.feature_extractor.draft_model.eval()
