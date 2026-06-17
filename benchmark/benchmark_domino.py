@@ -32,11 +32,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 # dflash_old2 harness (model package + distributed) — same as benchmark_refiner.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import sample, load_and_process_dataset, extract_context_feature
+from model.dflash_domino import DominoDraftModel  # self-contained domino drafter (no specforge dep)
 import distributed as dist
-
-# version2's DFlashDraftModel carries the domino head (prefix_gru/embed_proj) + cached forward.
-sys.path.insert(0, os.environ.get("SPECFORGE_V2", "/u/zwang33/SpecForge-version2"))
-from specforge.modeling.draft.dflash import DFlashDraftModel
 
 
 def cuda_time() -> float:
@@ -184,7 +181,7 @@ def main() -> None:
 
     target = (AutoModelForCausalLM.from_pretrained(args.model_name_or_path, attn_implementation=attn, dtype=torch.bfloat16)
               .to(device).eval())
-    drafter = (DFlashDraftModel.from_pretrained(args.draft_name_or_path, attn_implementation=attn, dtype=torch.bfloat16)
+    drafter = (DominoDraftModel.from_pretrained(args.draft_name_or_path, attn_implementation=attn, dtype=torch.bfloat16)
                .to(device).eval())
     drafter.config._attn_implementation = attn
     block_size = args.block_size or drafter.block_size
