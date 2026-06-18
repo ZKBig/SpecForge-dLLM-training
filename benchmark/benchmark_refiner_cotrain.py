@@ -24,10 +24,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model import DFlashDraftModel, load_and_process_dataset
 import distributed as dist
-from cudagraph_target import GraphedDecoder, baseline_generate_graphed
 
-# reuse the EXACT generation / loader / graph logic from benchmark_refiner (no duplication)
-from benchmark_refiner import dflash_generate, load_refiner, RefinerParKGraph
+# reuse the EXACT generation / loader logic from the (original) benchmark_refiner (no duplication)
+from benchmark_refiner import dflash_generate, load_refiner
 
 
 def main() -> None:
@@ -50,10 +49,6 @@ def main() -> None:
     )
     parser.add_argument("--conf-threshold", type=float, default=0.9)
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--cudagraph", action="store_true", help="CUDA-graph the target decode")
-    parser.add_argument("--graph-refiner", action="store_true",
-                        help="CUDA-graph the par-K refiner decode (greedy, temp=0).")
-    parser.add_argument("--max-cache-len", type=int, default=4096)
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -128,31 +123,6 @@ def main() -> None:
     if dist.is_main():
         print("running modes:", [m[0] for m in modes])
 
-    refiner_graphs = {}
-    if args.graph_refiner:
-        assert args.temperature == 0.0, "--graph-refiner is greedy (argmax); use --temperature 0.0"
-        assert not args.compile, "--graph-refiner and --compile are mutually exclusive"
-        ctx_dim = draft_model.fc.in_features
-        for name, bs, rf, rmode, rpasses in modes:
-            if rmode == "parallel" and rf is not None:
-                refiner_graphs[name] = RefinerParKGraph(
-                    rf, target.lm_head, target.model.embed_tokens,
-                    block_size, rpasses, ctx_dim, device, torch.bfloat16,
-                )
-        if dist.is_main():
-            print(f"[graph-refiner] captured par-K graphs for: {list(refiner_graphs)}")
-
-    graphed_baseline = None
-    graphed_verify = None
-    if args.cudagraph:
-        assert not args.compile, "--cudagraph and --compile are mutually exclusive"
-        torch.set_float32_matmul_precision("high")
-        if any(m[0] == "baseline" for m in modes):
-            graphed_baseline = GraphedDecoder(target, q_len=1, max_length=args.max_cache_len, device=device)
-        if any(m[1] > 1 for m in modes):
-            graphed_verify = GraphedDecoder(target, q_len=block_size, max_length=args.max_cache_len,
-                                            device=device, need_hidden=True)
-
     def load_ds(name):
         if name.endswith(".jsonl") or os.path.exists(name):
             import json
@@ -186,20 +156,12 @@ def main() -> None:
                 input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
                 response = {}
                 for name, bs, rf, rmode, rpasses in modes:
-                    if graphed_baseline is not None and name == "baseline":
-                        response[name] = baseline_generate_graphed(
-                            graphed_baseline, input_ids, max_new_tokens=args.max_new_tokens,
-                            stop_token_ids=[tokenizer.eos_token_id], temperature=args.temperature,
-                        )
-                        continue
                     response[name] = dflash_generate(
                         model=draft_model, target=target, input_ids=input_ids,
                         mask_token_id=draft_model.mask_token_id, max_new_tokens=args.max_new_tokens,
                         block_size=bs, stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature, refiner=rf, refine_mode=rmode, refine_passes=rpasses,
                         conf_threshold=args.conf_threshold,
-                        graphed_verify=graphed_verify if bs > 1 else None,
-                        refiner_graph=refiner_graphs.get(name),
                     )
                 key = next((n for n, _, rf, _, _ in modes if rf is not None), "drafter")
                 gen = response[key].output_ids[0, response[key].num_input_tokens:]
