@@ -4,16 +4,15 @@ Sibling of benchmark_refiner.py: SAME harness (distributed, dataset, target-veri
 multi-rank gather, output), but the block is drafted by the Domino GRU head instead of the
 AR refiner. Compares, on the SAME prompts:
   baseline : block_size=1 plain target AR (speedup reference)
-  drafter  : DFlash block draft -> target verify   (the domino model's drafter, NO GRU head)
-  domino   : DFlash block draft + GRU head (free-running) -> target verify
+  drafter  : the ORIGINAL z-lab DFlash drafter -> target verify (fair baseline, NO GRU head)
+  domino   : domino backbone + GRU head -> target verify
 
-The drafter is version2's DFlashDraftModel (it carries the domino head: prefix_gru + embed_proj,
-and the same cached inference forward as dflash_old2's model). The harness helpers (sample,
-extract_context_feature, dataset, distributed) are dflash_old2's, exactly like benchmark_refiner.
-
-Alignment: the domino config is shift_label (NEXT-token): output_hidden[k] predicts blk[k+1].
---align next (default) uses that; --align same reproduces generic DFlash spec_generate
-(output_hidden[k]->blk[k]). Run both and keep the one whose `drafter` accept is sane.
+The dflash_generate loop is a FAITHFUL port of Domino's official spec_generate
+(/u/zwang33/Domino/code/dflash.py): k_draft = block_size if shift_label else block_size-1, a
+separate verify_ids buffer of width k_draft+1, GRU initialized over the realized prefix and
+threaded with each drafted token. Alignment/k_draft is derived from the drafter's shift_label
+(no manual flag). Harness helpers (sample, extract_context_feature, dataset, distributed) and
+the cached DFlashDraftModel are dflash_old2 + version2, exactly like benchmark_refiner.
 
   ./run_benchmark_domino.sh <domino_ckpt_dir> [dataset] [max_samples]
 """
@@ -44,92 +43,126 @@ def cuda_time() -> float:
 @torch.inference_mode()
 def dflash_generate(
     drafter, target, input_ids, mask_token_id, max_new_tokens, block_size,
-    stop_token_ids, temperature=0.0, use_head=False, align="next",
+    stop_token_ids, temperature=0.0, use_head=False,
 ) -> SimpleNamespace:
-    """block_size==1 -> plain target AR (baseline). block_size>1 -> DFlash spec-decode,
-    with the Domino GRU head when use_head=True."""
+    """Faithful port of Domino's official spec_generate (Domino/code/dflash.py).
+
+    block_size==1 -> plain target AR (baseline). block_size>1 -> DFlash spec-decode:
+      * drafter INPUT is block_size wide (anchor + masks);
+      * but k_draft = block_size if shift_label else block_size-1 tokens are drafted into a
+        SEPARATE verify_ids buffer of width k_draft+1 (this is the off-by-one we were missing);
+      * shift_label uses ALL block_size hiddens (next-token h[i]->verify_ids[i+1]); non-shift
+        slices parallel_hiddens to [-block_size+1:] (same-position).
+    use_head=True applies the Domino GRU head: verify_ids[i+1] = argmax(base_logits[i] + bias),
+    bias = embed_proj([hidden_i, gru_state]), GRU initialized over the realized prefix and
+    threaded with each newly-drafted token (exactly the official loop)."""
     num_input = input_ids.shape[1]
     max_length = num_input + max_new_tokens
+    device = target.device
     embed = target.model.embed_tokens
     lm_head = target.lm_head
-    ss = (getattr(drafter, "pure_draft_prefix_len", 1) if drafter.shift_label
-          else 1 + getattr(drafter, "pure_draft_prefix_len", 0))
 
-    output_ids = torch.full((1, max_length + block_size), mask_token_id, dtype=torch.long, device=target.device)
-    position_ids = torch.arange(output_ids.shape[1], device=target.device).unsqueeze(0)
+    # --- baseline: plain target autoregressive decode ---
+    if block_size == 1:
+        pkv = DynamicCache()
+        pos = torch.arange(max_length + 1, device=device).unsqueeze(0)
+        t0 = cuda_time()
+        out = target(input_ids, position_ids=pos[:, :num_input], past_key_values=pkv,
+                     use_cache=True, logits_to_keep=1)
+        ttft = cuda_time() - t0
+        tok = sample(out.logits, temperature)
+        ids = [tok]
+        cur = num_input
+        decode_start = cuda_time()
+        for _ in range(max_new_tokens - 1):
+            out = target(tok, position_ids=pos[:, cur:cur + 1], past_key_values=pkv, use_cache=True)
+            tok = sample(out.logits, temperature)
+            ids.append(tok)
+            cur += 1
+            if stop_token_ids and tok.item() in stop_token_ids:
+                break
+        dt = cuda_time() - decode_start
+        n = len(ids)
+        out_ids = torch.cat([input_ids] + ids, dim=1)
+        return SimpleNamespace(
+            output_ids=out_ids, num_input_tokens=num_input, num_output_tokens=n,
+            time_to_first_token=ttft, time_per_output_token=dt / max(n, 1),
+            acceptance_lengths=[1] * n,
+        )
+
+    # --- block spec-decode (faithful to official) ---
+    shift_label = bool(getattr(drafter, "shift_label", False))
+    prefix_len = int(getattr(drafter, "pure_draft_prefix_len", 0)) if use_head else 0
+    extra = block_size + 1 if shift_label else block_size
+
+    output_ids = torch.full((1, max_length + extra), mask_token_id, dtype=torch.long, device=device)
+    position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
     pkv_target = DynamicCache()
     pkv_draft = DynamicCache()
 
-    # prefill
     prefill_start = cuda_time()
     out = target(input_ids, position_ids=position_ids[:, :num_input], past_key_values=pkv_target,
-                 use_cache=True, logits_to_keep=1, output_hidden_states=(block_size > 1))
+                 use_cache=True, logits_to_keep=1, output_hidden_states=True)
     output_ids[:, :num_input] = input_ids
-    output_ids[:, num_input:num_input + 1] = sample(out.logits[:, -1:, :], temperature)
-    target_hidden = extract_context_feature(out.hidden_states, drafter.target_layer_ids) if block_size > 1 else None
+    output_ids[:, num_input:num_input + 1] = sample(out.logits, temperature)
+    target_hidden = extract_context_feature(out.hidden_states, drafter.target_layer_ids)
     ttft = cuda_time() - prefill_start
 
     accept_lengths = []
     start = num_input
     decode_start = cuda_time()
     draft_prefill = True
-    stop_tensor = torch.tensor(stop_token_ids, device=target.device) if stop_token_ids else None
+    stop_tensor = torch.tensor(stop_token_ids, device=device) if stop_token_ids else None
     checked = start
 
     while start < max_length:
-        block_ids = output_ids[:, start:start + block_size].clone()
-        block_pos = position_ids[:, start:start + block_size]
+        block_input = output_ids[:, start:start + block_size].clone()      # noise: anchor + masks
+        noise_emb = embed(block_input)
+        draft_out = drafter(
+            target_hidden=target_hidden, noise_embedding=noise_emb,
+            position_ids=position_ids[:, pkv_draft.get_seq_length():start + block_size],
+            past_key_values=pkv_draft, use_cache=True, is_causal=False,
+        )
+        pkv_draft.crop(start)
 
-        if block_size > 1:
-            noise_emb = embed(block_ids)
-            draft_out = drafter(
-                target_hidden=target_hidden, noise_embedding=noise_emb,
-                position_ids=position_ids[:, pkv_draft.get_seq_length():start + block_size],
-                past_key_values=pkv_draft, use_cache=True, is_causal=False,
-            )
-            pkv_draft.crop(start)
-            h = draft_out[:, -block_size:, :]                            # (1, block, H); h[0]=anchor
-            base_logits = lm_head(h)                                     # (1, block, V)
+        parallel_h = draft_out[:, -block_size:, :]
+        if not shift_label:
+            parallel_h = parallel_h[:, -block_size + 1:, :]
+        base_logits = lm_head(parallel_h)
+        k_draft = block_size if shift_label else block_size - 1
 
-            if not use_head:
-                if align == "next":                                     # h[k] -> blk[k+1]
-                    block_ids[:, 1:] = sample(base_logits[:, :block_size - 1, :], temperature)
-                else:                                                   # h[k] -> blk[k]
-                    block_ids[:, 1:] = sample(base_logits[:, 1:, :], temperature)
-            else:
-                gru, embed_proj = drafter.prefix_gru, drafter.embed_proj
-                h_gru = None
-                if align == "next":
-                    for k in range(block_size - 1):                     # predict blk[k+1] from h[k]
-                        g_out, h_gru = gru(embed(block_ids[:, k:k + 1]), h_gru)   # GRU(blk[0..k])
-                        logit = base_logits[:, k, :]
-                        if k >= ss:
-                            logit = logit + embed_proj(torch.cat([h[:, k, :], g_out[:, 0, :]], dim=-1))
-                        block_ids[:, k + 1] = sample(logit.unsqueeze(1), temperature)[:, 0]
-                else:
-                    for k in range(1, block_size):                     # predict blk[k] from h[k]
-                        g_out, h_gru = gru(embed(block_ids[:, k - 1:k]), h_gru)
-                        logit = base_logits[:, k, :]
-                        if k >= ss:
-                            logit = logit + embed_proj(torch.cat([h[:, k, :], g_out[:, 0, :]], dim=-1))
-                        block_ids[:, k] = sample(logit.unsqueeze(1), temperature)[:, 0]
+        verify_ids = torch.full((1, k_draft + 1), mask_token_id, dtype=torch.long, device=device)
+        verify_ids[:, 0] = output_ids[:, start]
+        verify_pos = position_ids[:, start:start + k_draft + 1]
 
-            if draft_prefill:
-                draft_prefill = False
-                decode_start = cuda_time()
+        if prefix_len > 0:                                                 # prefix: drafter base only
+            verify_ids[:, 1:1 + prefix_len] = sample(base_logits[:, :prefix_len, :], temperature)
 
-        # target verify
-        out = target(block_ids, position_ids=block_pos, past_key_values=pkv_target,
-                     use_cache=True, output_hidden_states=(block_size > 1))
+        if use_head:
+            gru, embed_proj = drafter.prefix_gru, drafter.embed_proj
+            _, gru_hidden = gru(embed(verify_ids[:, :1 + prefix_len]))     # GRU over [anchor, prefix...]
+            for i in range(prefix_len, k_draft):
+                z_i = parallel_h[:, i:i + 1, :]
+                s_i = gru_hidden.transpose(0, 1)
+                bias = embed_proj(torch.cat([z_i, s_i], dim=-1))
+                tok = sample(base_logits[:, i:i + 1, :] + bias, temperature)
+                verify_ids[:, i + 1:i + 2] = tok
+                if i + 1 < k_draft:
+                    _, gru_hidden = gru(embed(tok), gru_hidden)            # thread the drafted token
+        else:                                                             # plain drafter: all base
+            verify_ids[:, 1 + prefix_len:] = sample(base_logits[:, prefix_len:k_draft, :], temperature)
+
+        if draft_prefill:
+            draft_prefill = False
+            decode_start = cuda_time()
+
+        out = target(verify_ids, position_ids=verify_pos, past_key_values=pkv_target,
+                     use_cache=True, output_hidden_states=True)
         posterior = sample(out.logits, temperature)
-        if block_size > 1:
-            acc = (block_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
-        else:
-            acc = 0
-        output_ids[:, start:start + acc + 1] = block_ids[:, :acc + 1]
+        acc = (verify_ids[:, 1:] == posterior[:, :-1]).cumprod(dim=1).sum(dim=1)[0].item()
+        output_ids[:, start:start + acc + 1] = verify_ids[:, :acc + 1]
         output_ids[:, start + acc + 1] = posterior[:, acc]
-        if block_size > 1:
-            target_hidden = extract_context_feature(out.hidden_states, drafter.target_layer_ids)[:, :acc + 1, :]
+        target_hidden = extract_context_feature(out.hidden_states, drafter.target_layer_ids)[:, :acc + 1, :]
         accept_lengths.append(acc + 1)
         start += acc + 1
         pkv_target.crop(start)
@@ -155,8 +188,10 @@ def main() -> None:
     parser.add_argument("--model-name-or-path", type=str, required=True)
     parser.add_argument("--draft-name-or-path", type=str, required=True,
                         help="trained Domino checkpoint dir (save_pretrained: epoch_X_step_Y)")
+    parser.add_argument("--baseline-draft-path", type=str, default="z-lab/Qwen3-8B-DFlash-b16",
+                        help="drafter used for the FAIR 'drafter' baseline — the ORIGINAL published "
+                        "DFlash, NOT the domino-trained backbone (which is co-trained/altered).")
     parser.add_argument("--modes", type=str, default="baseline,drafter,domino")
-    parser.add_argument("--align", type=str, default="next", choices=["next", "same"])
     parser.add_argument("--block-size", type=int, default=None)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--max-samples", type=int, default=None)
@@ -179,30 +214,39 @@ def main() -> None:
             print("[warn] flash_attn not installed; using sdpa (lower speedup).")
         attn = "sdpa"
 
+    def load_drafter(path):
+        d = DominoDraftModel.from_pretrained(path, attn_implementation=attn, dtype=torch.bfloat16).to(device).eval()
+        d.config._attn_implementation = attn
+        return d
+
     target = (AutoModelForCausalLM.from_pretrained(args.model_name_or_path, attn_implementation=attn, dtype=torch.bfloat16)
               .to(device).eval())
-    drafter = (DominoDraftModel.from_pretrained(args.draft_name_or_path, attn_implementation=attn, dtype=torch.bfloat16)
-               .to(device).eval())
-    drafter.config._attn_implementation = attn
-    block_size = args.block_size or drafter.block_size
-    mask_token_id = drafter.mask_token_id
+    domino_drafter = load_drafter(args.draft_name_or_path)            # backbone + GRU head (domino/cotrain/full)
+    # FAIR baseline: the ORIGINAL published DFlash drafter, not the (co-)trained domino backbone.
+    baseline_drafter = (domino_drafter if args.baseline_draft_path == args.draft_name_or_path
+                        else load_drafter(args.baseline_draft_path))
+    block_size = args.block_size or domino_drafter.block_size
+    mask_token_id = domino_drafter.mask_token_id
     if dist.is_main():
-        proj = drafter.config.dflash_config.get("projector_type")
-        print(f"projector={proj} shift_label={drafter.shift_label} block_size={block_size} align={args.align}")
+        proj = domino_drafter.config.dflash_config.get("projector_type")
+        print(f"domino: projector={proj} shift_label={domino_drafter.shift_label} "
+              f"prefix_len={getattr(domino_drafter, 'pure_draft_prefix_len', 0)}")
+        print(f"drafter baseline: {args.baseline_draft_path} shift_label={baseline_drafter.shift_label}")
         if proj != "domino" and "domino" in args.modes:
-            print("[warn] checkpoint has NO domino projector — 'domino' mode will fail.")
+            print("[warn] --draft-name-or-path has NO domino projector — 'domino' mode will fail.")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     stop_ids = [tokenizer.eos_token_id]
-    # each mode -> (name, block_size, use_head)
+    # each mode -> (name, block_size, use_head, drafter_model). alignment/k_draft is derived
+    # from the drafter's shift_label inside dflash_generate (faithful to official spec_generate).
     mode_cfg = []
     for tok in [m.strip() for m in args.modes.split(",") if m.strip()]:
         if tok == "baseline":
-            mode_cfg.append(("baseline", 1, False))
-        elif tok == "drafter":
-            mode_cfg.append(("drafter", block_size, False))
-        elif tok == "domino":
-            mode_cfg.append(("domino", block_size, True))
+            mode_cfg.append(("baseline", 1, False, baseline_drafter))
+        elif tok == "drafter":   # ORIGINAL DFlash drafter, no head
+            mode_cfg.append(("drafter", block_size, False, baseline_drafter))
+        elif tok == "domino":    # domino backbone + GRU head
+            mode_cfg.append(("domino", block_size, True, domino_drafter))
         else:
             if dist.is_main():
                 print(f"[warn] skipping unknown mode '{tok}'")
@@ -241,10 +285,10 @@ def main() -> None:
                 )
                 input_ids = tokenizer.encode(text, return_tensors="pt").to(device)
                 response = {}
-                for name, bs, use_head in mode_cfg:
+                for name, bs, use_head, drf in mode_cfg:
                     response[name] = dflash_generate(
-                        drafter, target, input_ids, mask_token_id, args.max_new_tokens, bs,
-                        stop_ids, args.temperature, use_head=use_head, align=args.align,
+                        drf, target, input_ids, drf.mask_token_id, args.max_new_tokens, bs,
+                        stop_ids, args.temperature, use_head=use_head,
                     )
                 # multi-turn: continue with a speculative mode's output (domino if present, else drafter)
                 key = "domino" if "domino" in response else ("drafter" if "drafter" in response else mode_cfg[0][0])
@@ -262,14 +306,14 @@ def main() -> None:
         else:
             recs = local
 
-        print(f"\n========== {ds_name}  (n={len(recs)}, block={block_size}, align={args.align}) ==========")
+        print(f"\n========== {ds_name}  (n={len(recs)}, block={block_size}) ==========")
         ref = "baseline" if any(m[0] == "baseline" for m in mode_cfg) else mode_cfg[0][0]
         t_ref = np.mean([r[ref]["tpot"] for r in recs])
-        for name, _, _ in mode_cfg:
+        for name, _, _, _ in mode_cfg:
             t = np.mean([r[name]["tpot"] for r in recs])
             tau = np.mean([np.mean(r[name]["acc"]) for r in recs])
             accs = list(chain(*[r[name]["acc"] for r in recs]))
-            hist = [accs.count(b) / len(accs) for b in range(block_size + 1)]
+            hist = [accs.count(b) / len(accs) for b in range(block_size + 2)]
             print(f"[{name:9s}] accept={tau:.2f}  tpot={t*1000:.2f}ms  vs_{ref}={t_ref/t:.2f}x")
             print(f"            histogram: {[f'{x*100:.0f}%' for x in hist]}")
         print("=" * 60)
