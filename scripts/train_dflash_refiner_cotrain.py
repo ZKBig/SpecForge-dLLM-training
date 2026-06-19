@@ -120,6 +120,21 @@ def parse_args():
         help="Fraction of total steps over which lambda_base decays linearly to 0 "
         "(1.0 = decay across the whole run, Domino default).",
     )
+    # --- refiner architecture ablations (all optional, default == current) ---
+    refiner_group.add_argument(
+        "--mixer-type", type=str, default="attention", choices=["attention", "sgu"],
+        help="causal mixer: 'attention' (Qwen3 self-attn) | 'sgu' (channel-wise lower-triangular "
+        "causal mix — cheap, fixed, block-internal; pair with --gate-type perpos).",
+    )
+    refiner_group.add_argument(
+        "--pool-type", type=str, default="mean", choices=["mean", "xattn"],
+        help="global pool token: 'mean' (mean-pool) | 'xattn' (cross-attention over the dflash output set).",
+    )
+    refiner_group.add_argument(
+        "--gate-type", type=str, default="scalar", choices=["scalar", "perpos"],
+        help="residual gate: 'scalar' (one global ReZero) | 'perpos' (input-dependent sigmoid(w.h) "
+        "per position — learns WHERE to refine; needs --use-residual-gate).",
+    )
 
     dataset_group = parser.add_argument_group("dataset")
     dataset_group.add_argument("--train-data-path", type=str, required=True)
@@ -246,6 +261,9 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
                 "args": args,
                 "window_size": args.window_size,
                 "num_refiner_layers": args.num_refiner_layers,
+                "mixer_type": args.mixer_type,
+                "pool_type": args.pool_type,
+                "gate_type": args.gate_type,
                 "refiner_state_dict": refiner_state_dict,
                 "draft_state_dict": draft_state_dict,
                 # BF16Optimizer holds fp32 master copies -> its state is REPLICATED across
@@ -394,6 +412,9 @@ def main():
         residual_gate_init=args.residual_gate_init,
         freeze_residual_gate=args.freeze_residual_gate,
         loss_decay_gamma=args.loss_decay_gamma,
+        mixer_type=args.mixer_type,
+        pool_type=args.pool_type,
+        gate_type=args.gate_type,
     ).cuda()
     refiner_model.refiner = refiner_model.refiner.to(torch.bfloat16)
     print_on_rank0(
