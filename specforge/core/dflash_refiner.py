@@ -131,61 +131,114 @@ class DFlashFeatureExtractor(OnlineDFlashModel):
         )
 
 
-class RefinerLayer(nn.Module):
-    """One Qwen3-style decoder layer for the refiner.
+class ChannelWiseCausalMix(nn.Module):
+    """Per-channel learned lower-triangular token mixing (causal gMLP / MLP-Mixer style).
 
-    Query = the `block` positions. Keys/Values = [window ; block]. The mask makes each
-    block position attend to (a) all valid window tokens and (b) block positions <= k
-    (causal). RoPE positions run 0..(W+block-1) so relative order is correct.
+    Replaces attention's q/k/v/o + softmax with a FIXED (learned) per-channel position mixing:
+        u[b,k,c] = sum_{j<=k} L[c,k,j] * x[b,j,c]
+    ~H*block*block params (tiny), one bmm, no softmax, no projections -> ~40x less weight to load
+    than attention. NOT input-adaptive (the gate supplies that). Init to identity (starts as no-op).
     """
+
+    def __init__(self, hidden_size, block_size):
+        super().__init__()
+        self.L = nn.Parameter(torch.eye(block_size).unsqueeze(0).repeat(hidden_size, 1, 1))
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):                                  # x: (BN, block, H)
+        Lm = self.L * self.tril                            # (H, block, block) causal
+        return torch.bmm(Lm, x.permute(2, 1, 0)).permute(2, 1, 0)   # (BN, block, H)
+
+
+class CrossAttentionPool(nn.Module):
+    """Learned global pool: each position cross-attends (NON-causal) to the SET of dflash
+    outputs {h[j]} -> a per-position learned summary, replacing the crude mean-pool token."""
 
     def __init__(self, config):
         super().__init__()
         H = config.hidden_size
-        self.head_dim = getattr(
-            config, "head_dim", H // config.num_attention_heads
-        )
         self.n_heads = config.num_attention_heads
-        self.n_kv = config.num_key_value_heads
-        self.q_proj = nn.Linear(H, self.n_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(H, self.n_kv * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(H, self.n_kv * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.n_heads * self.head_dim, H, bias=config.attention_bias)
-        self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.head_dim = getattr(config, "head_dim", H // self.n_heads)
+        self.q_proj = nn.Linear(H, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(H, self.n_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(H, self.n_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, H, bias=False)
+
+    def forward(self, h):                                  # (BN, block, H)
+        bn, block, _ = h.shape
+        q = self.q_proj(h).view(bn, block, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(h).view(bn, block, self.n_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(h).view(bn, block, self.n_heads, self.head_dim).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v)      # no mask -> non-causal over the whole set
+        out = out.transpose(1, 2).reshape(bn, block, -1)
+        return self.o_proj(out)
+
+
+class RefinerLayer(nn.Module):
+    """One refiner layer. mixer_type='attention' = Qwen3-style causal self-attn (+ optional window);
+    mixer_type='sgu' = channel-wise lower-triangular causal mix (cheap, fixed, block-internal only)."""
+
+    def __init__(self, config, mlp_intermediate=None, mixer_type="attention", block_size=16):
+        super().__init__()
+        H = config.hidden_size
+        self.mixer_type = mixer_type
         self.input_layernorm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
-        self.mlp = Qwen3MLP(config)
+        if mixer_type == "sgu":
+            self.mix = ChannelWiseCausalMix(H, block_size)
+            self.mix_out = nn.Linear(H, H, bias=False)
+        else:
+            self.head_dim = getattr(config, "head_dim", H // config.num_attention_heads)
+            self.n_heads = config.num_attention_heads
+            self.n_kv = config.num_key_value_heads
+            self.q_proj = nn.Linear(H, self.n_heads * self.head_dim, bias=config.attention_bias)
+            self.k_proj = nn.Linear(H, self.n_kv * self.head_dim, bias=config.attention_bias)
+            self.v_proj = nn.Linear(H, self.n_kv * self.head_dim, bias=config.attention_bias)
+            self.o_proj = nn.Linear(self.n_heads * self.head_dim, H, bias=config.attention_bias)
+            self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        # MLP cost = 3 * H * intermediate; mlp_intermediate=None -> default; >0 -> shrink; <=0 -> drop.
+        if mlp_intermediate is not None and mlp_intermediate <= 0:
+            self.mlp = None
+        else:
+            self.post_attention_layernorm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
+            if mlp_intermediate is None:
+                self.mlp = Qwen3MLP(config)
+            else:
+                import copy
+                cfg = copy.copy(config)
+                cfg.intermediate_size = int(mlp_intermediate)
+                self.mlp = Qwen3MLP(cfg)
 
     def forward(self, x, win_h, cos, sin, attn_mask):
         bn, q_len, _ = x.shape
         residual = x
         xn = self.input_layernorm(x)
 
-        q = self.q_proj(xn).view(bn, q_len, -1, self.head_dim)
-        q = self.q_norm(q).transpose(1, 2)  # (bn, n_heads, q_len, hd)
+        if self.mixer_type == "sgu":
+            # channel-wise causal mix; ignores window/rope/mask (block-internal causal only)
+            x = residual + self.mix_out(self.mix(xn))
+        else:
+            q = self.q_proj(xn).view(bn, q_len, -1, self.head_dim)
+            q = self.q_norm(q).transpose(1, 2)
+            kv_in = xn if win_h is None else torch.cat([win_h, xn], dim=1)
+            kv_len = kv_in.size(1)
+            k = self.k_proj(kv_in).view(bn, kv_len, -1, self.head_dim)
+            k = self.k_norm(k).transpose(1, 2)
+            v = self.v_proj(kv_in).view(bn, kv_len, -1, self.head_dim).transpose(1, 2)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            if self.n_kv != self.n_heads:
+                rep = self.n_heads // self.n_kv
+                k = k.repeat_interleave(rep, dim=1)
+                v = v.repeat_interleave(rep, dim=1)
+            attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
+            attn = attn.transpose(1, 2).reshape(bn, q_len, -1)
+            x = residual + self.o_proj(attn)
 
-        kv_in = xn if win_h is None else torch.cat([win_h, xn], dim=1)
-        kv_len = kv_in.size(1)
-        k = self.k_proj(kv_in).view(bn, kv_len, -1, self.head_dim)
-        k = self.k_norm(k).transpose(1, 2)  # (bn, n_kv, kv_len, hd)
-        v = self.v_proj(kv_in).view(bn, kv_len, -1, self.head_dim).transpose(1, 2)
-
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)  # q uses last q_len of cos
-
-        if self.n_kv != self.n_heads:  # GQA
-            rep = self.n_heads // self.n_kv
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-
-        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
-        attn = attn.transpose(1, 2).reshape(bn, q_len, -1)
-        x = residual + self.o_proj(attn)
-
-        residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
-        x = residual + x
+        if self.mlp is not None:
+            residual = x
+            x = self.post_attention_layernorm(x)
+            x = self.mlp(x)
+            x = residual + x
         return x
 
 
@@ -212,27 +265,44 @@ class RefinerDecoder(nn.Module):
         use_residual_gate: bool = False,
         residual_gate_init: float = 0.0,
         freeze_residual_gate: bool = False,
+        mlp_intermediate=None,
+        mixer_type: str = "attention",   # "attention" | "sgu" (channel-wise causal mix)
+        pool_type: str = "mean",         # "mean" | "xattn" (cross-attention pool over dflash set)
+        gate_type: str = "scalar",       # "scalar" (global ReZero) | "perpos" (input-dependent sigma(w.h))
+        block_size: int = 16,
     ):
         super().__init__()
         H = config.hidden_size
         self.window_size = window_size
         self.use_residual_gate = use_residual_gate
+        self.mixer_type = mixer_type
+        self.pool_type = pool_type
+        self.gate_type = gate_type
         self.in_proj = nn.Linear(3 * H, H, bias=False)
         if window_size > 0:
             self.window_in_proj = nn.Linear(ctx_dim, H, bias=False)
             self.window_norm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
+        if pool_type == "xattn":
+            self.pool = CrossAttentionPool(config)         # learned global pool (replaces mean)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
-        self.layers = nn.ModuleList([RefinerLayer(config) for _ in range(num_layers)])
+        self.layers = nn.ModuleList(
+            [RefinerLayer(config, mlp_intermediate=mlp_intermediate,
+                          mixer_type=mixer_type, block_size=block_size) for _ in range(num_layers)]
+        )
         self.norm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
-        # Residual gate: out = h[k] + gate * correction.
-        #   learnable (default): zero-init -> starts == drafter, learns the gate (ReZero).
-        #   frozen: fixed buffer at residual_gate_init (e.g. 1.0 = plain full residual), not trained.
+        # Residual gate: out = h + gate * correction.
+        #   scalar: one ReZero scalar (global); perpos: sigma(w.h) per-position, input-dependent.
         if use_residual_gate:
-            gate0 = torch.full((1,), float(residual_gate_init))
-            if freeze_residual_gate:
-                self.register_buffer("residual_gate", gate0)
+            if gate_type == "perpos":
+                self.gate_proj = nn.Linear(H, 1, bias=True)   # g[k] = sigmoid(w . h[k])
+                nn.init.zeros_(self.gate_proj.weight)
+                nn.init.constant_(self.gate_proj.bias, -5.0)  # sigmoid(-5) ~ 0 -> starts == drafter
             else:
-                self.residual_gate = nn.Parameter(gate0)
+                gate0 = torch.full((1,), float(residual_gate_init))
+                if freeze_residual_gate:
+                    self.register_buffer("residual_gate", gate0)
+                else:
+                    self.residual_gate = nn.Parameter(gate0)
 
     def forward(
         self,
@@ -245,33 +315,38 @@ class RefinerDecoder(nn.Module):
         bn, block, _ = h.shape
         device = h.device
 
+        if self.pool_type == "xattn":
+            g = self.pool(h)                                   # learned pool (ignores the passed mean g)
+
         x = self.in_proj(torch.cat([h, g, prev_emb], dim=-1))  # (BN, block, H)
 
-        win_h = None
-        W = 0
-        if self.window_size > 0 and window_hidden is not None:
-            win_h = self.window_norm(self.window_in_proj(window_hidden))  # (BN, W, H)
-            W = win_h.size(1)
-
-        kv_len = W + block
-        position_ids = torch.arange(kv_len, device=device).unsqueeze(0).expand(bn, -1)
-        cos, sin = self.rotary_emb(x, position_ids)
-
-        # attention mask (BN, 1, block, kv_len), True = attend
-        causal = torch.tril(torch.ones(block, block, dtype=torch.bool, device=device))
-        if W > 0:
-            win_vis = window_mask.bool()[:, None, :].expand(bn, block, W)
-            mask = torch.cat([win_vis, causal[None].expand(bn, block, block)], dim=-1)
-        else:
-            mask = causal[None].expand(bn, block, block)
-        attn_mask = mask[:, None, :, :]
+        win_h, cos, sin, attn_mask = None, None, None, None
+        if self.mixer_type == "attention":
+            W = 0
+            if self.window_size > 0 and window_hidden is not None:
+                win_h = self.window_norm(self.window_in_proj(window_hidden))
+                W = win_h.size(1)
+            kv_len = W + block
+            position_ids = torch.arange(kv_len, device=device).unsqueeze(0).expand(bn, -1)
+            cos, sin = self.rotary_emb(x, position_ids)
+            causal = torch.tril(torch.ones(block, block, dtype=torch.bool, device=device))
+            if W > 0:
+                win_vis = window_mask.bool()[:, None, :].expand(bn, block, W)
+                mask = torch.cat([win_vis, causal[None].expand(bn, block, block)], dim=-1)
+            else:
+                mask = causal[None].expand(bn, block, block)
+            attn_mask = mask[:, None, :, :]
 
         for layer in self.layers:
             x = layer(x, win_h, cos, sin, attn_mask)
         out = self.norm(x)
         if self.use_residual_gate:
-            # head_in = drafter hidden + gate * correction; gate starts at 0 => == drafter
-            out = h + self.residual_gate * out
+            # out = h + gate * correction; gate starts ~0 => == drafter
+            if self.gate_type == "perpos":
+                gate = torch.sigmoid(self.gate_proj(h))        # (BN, block, 1) input-dependent
+            else:
+                gate = self.residual_gate
+            out = h + gate * out
         return out
 
 
@@ -292,6 +367,10 @@ class OnlineDFlashRefiner(nn.Module):
         residual_gate_init: float = 0.0,
         freeze_residual_gate: bool = False,
         loss_decay_gamma: float = None,
+        mlp_intermediate=None,
+        mixer_type: str = "attention",
+        pool_type: str = "mean",
+        gate_type: str = "scalar",
     ):
         super().__init__()
         self.feature_extractor = feature_extractor
@@ -308,6 +387,11 @@ class OnlineDFlashRefiner(nn.Module):
             use_residual_gate=use_residual_gate,
             residual_gate_init=residual_gate_init,
             freeze_residual_gate=freeze_residual_gate,
+            mlp_intermediate=mlp_intermediate,
+            mixer_type=mixer_type,
+            pool_type=pool_type,
+            gate_type=gate_type,
+            block_size=self.block_size,
         )
 
         # freeze everything except the refiner
