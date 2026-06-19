@@ -417,19 +417,21 @@ def main():
         gate_type=args.gate_type,
     ).cuda()
     refiner_model.refiner = refiner_model.refiner.to(torch.bfloat16)
-    print_on_rank0(
-        "==================== REFINER ARCH ====================\n"
-        f"  mixer_type   = {args.mixer_type}        (attention | sgu)\n"
-        f"  pool_type    = {args.pool_type}         (mean | xattn)\n"
-        f"  gate_type    = {args.gate_type}         (scalar | perpos)  use_residual_gate={args.use_residual_gate}\n"
-        f"  window_size  = {args.window_size}   num_refiner_layers = {args.num_refiner_layers}   "
-        f"mlp_intermediate = {getattr(args, 'mlp_intermediate', None)}\n"
-        f"  lambda_base  = {args.lambda_base_start}->0 (ratio {args.lambda_base_decay_ratio})   "
-        f"drafter_lr_scale = {args.drafter_lr_scale}\n"
-        f"  head params  = {sum(p.numel() for p in refiner_model.refiner.parameters()):,} | "
-        f"co-trained drafter params = {refiner_model._cotrain_drafter_params:,}\n"
-        "======================================================"
-    )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(
+            "\n==================== REFINER ARCH ====================\n"
+            f"  mixer_type   = {args.mixer_type}        (attention | sgu)\n"
+            f"  pool_type    = {args.pool_type}         (mean | xattn)\n"
+            f"  gate_type    = {args.gate_type}         (scalar | perpos)  use_residual_gate={args.use_residual_gate}\n"
+            f"  window_size  = {args.window_size}   num_refiner_layers = {args.num_refiner_layers}   "
+            f"mlp_intermediate = {getattr(args, 'mlp_intermediate', None)}\n"
+            f"  lambda_base  = {args.lambda_base_start}->0 (ratio {args.lambda_base_decay_ratio})   "
+            f"drafter_lr_scale = {args.drafter_lr_scale}\n"
+            f"  head params  = {sum(p.numel() for p in refiner_model.refiner.parameters()):,} | "
+            f"co-trained drafter params = {refiner_model._cotrain_drafter_params:,}\n"
+            "======================================================\n",
+            flush=True,
+        )
 
     # FSDP-wrap BOTH trainable modules: the refiner head AND the drafter backbone.
     refiner_model.refiner = FSDP(
