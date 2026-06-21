@@ -266,13 +266,21 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
                 "gate_type": args.gate_type,
                 "refiner_state_dict": refiner_state_dict,
                 "draft_state_dict": draft_state_dict,
-                # BF16Optimizer holds fp32 master copies -> its state is REPLICATED across
-                # ranks, so rank-0's optimizer.state_dict() is the full state.
-                **optimizer.state_dict(),
+                # Scheduler is REPLICATED across ranks -> store it in the rank-0 file.
+                # The optimizer (Adam) state is FSDP-SHARDED (per-rank, different sizes)
+                # because fp32_params clone the LOCAL FSDP shards -> saved per-rank below.
+                "scheduler_state_dict": optimizer.scheduler.state_dict(),
             },
             os.path.join(save_dir, "refiner_cotrain.pt"),
         )
         print_on_rank0(f"Saved co-train checkpoint (refiner+drafter) to {save_dir}")
+
+    # Every rank writes its OWN optimizer (Adam) shard. save_dir already exists for all
+    # ranks (rank-0 mkdir + barrier above). On resume each rank reloads its matching shard.
+    torch.save(
+        {"optimizer_state_dict": optimizer.optimizer.state_dict()},
+        os.path.join(save_dir, f"optim_rank{dist.get_rank()}.pt"),
+    )
     dist.barrier()
 
 
@@ -490,12 +498,20 @@ def main():
                     refiner_model.feature_extractor.draft_model.load_state_dict(
                         state["draft_state_dict"]
                     )
-            if "optimizer_state_dict" in state:
-                optimizer.load_state_dict(state)
-                print_on_rank0("Restored optimizer + scheduler state.")
-            else:
+            # Scheduler is replicated -> always restore (continues LR schedule exactly).
+            if "scheduler_state_dict" in state:
                 optimizer.scheduler.load_state_dict(state["scheduler_state_dict"])
-                print_on_rank0("[warn] no optimizer_state_dict in checkpoint; scheduler only (will dip).")
+            # Optimizer (Adam) state is FSDP-SHARDED -> each rank loads ITS OWN shard.
+            # Loading rank-0's state into every rank crashes (size mismatch). Old
+            # checkpoints without per-rank shards just reset Adam moments (small dip).
+            optim_file = os.path.join(last_ckpt, f"optim_rank{dist.get_rank()}.pt")
+            if os.path.exists(optim_file):
+                opt_state = torch.load(optim_file, map_location="cpu", weights_only=False)
+                optimizer.optimizer.load_state_dict(opt_state["optimizer_state_dict"])
+                print_on_rank0("Restored per-rank optimizer (Adam) shards + scheduler.")
+            else:
+                print_on_rank0("[warn] no per-rank optim shards (old checkpoint); "
+                               "Adam moments reset (small dip), scheduler restored.")
             start_epoch = state["epoch"]
             global_step = state["global_step"]
             print_on_rank0(f"Resumed from epoch {start_epoch}, step {global_step}")
