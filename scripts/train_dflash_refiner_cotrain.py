@@ -498,6 +498,15 @@ def main():
                     refiner_model.feature_extractor.draft_model.load_state_dict(
                         state["draft_state_dict"]
                     )
+            # CRITICAL: the BF16 optimizer holds fp32 MASTER copies cloned at construction
+            # (pre-resume init weights). The load_state_dict calls above updated the model's
+            # p.data but NOT these masters. On the first step(), p.data.copy_(master) would
+            # overwrite the freshly-loaded checkpoint weights with the stale init masters and
+            # silently revert the model (train loss looks fine for one step, then eval craters).
+            # Re-sync the masters from the just-loaded model params.
+            with torch.no_grad():
+                for p, mp in zip(optimizer.model_params, optimizer.fp32_params):
+                    mp.data.copy_(p.data.to(torch.float32))
             # Scheduler is replicated -> always restore (continues LR schedule exactly).
             if "scheduler_state_dict" in state:
                 optimizer.scheduler.load_state_dict(state["scheduler_state_dict"])
