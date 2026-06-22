@@ -280,6 +280,7 @@ class RefinerDecoder(nn.Module):
         block_size: int = 16,
         zero_init_oproj: bool = False,   # zero-init attention o_proj (attention sublayer starts as no-op)
         gate_floor: float = 0.0,         # perpos gate floor: g = eps + (1-eps)*sigmoid(w.h), keeps g>=eps
+        gate_bias_init: float = -5.0,    # perpos gate bias init: -5 => g~0 (==drafter); 0 => g~0.5 (strong early grad)
     ):
         super().__init__()
         H = config.hidden_size
@@ -295,6 +296,11 @@ class RefinerDecoder(nn.Module):
             self.window_norm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
         if pool_type == "xattn":
             self.pool = CrossAttentionPool(config)         # learned global pool (replaces mean)
+            if zero_init_oproj:
+                # Same entry-side fix as the mixer: the xattn pool is another randomly-init
+                # data-dependent attention module. Zero its o_proj so g starts at 0 (no harmful
+                # random summary injected at step 0); the learned pool grows in from there.
+                nn.init.zeros_(self.pool.o_proj.weight)
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.layers = nn.ModuleList(
             [RefinerLayer(config, mlp_intermediate=mlp_intermediate,
@@ -308,7 +314,7 @@ class RefinerDecoder(nn.Module):
             if gate_type == "perpos":
                 self.gate_proj = nn.Linear(H, 1, bias=True)   # g[k] = sigmoid(w . h[k])
                 nn.init.zeros_(self.gate_proj.weight)
-                nn.init.constant_(self.gate_proj.bias, -5.0)  # sigmoid(-5) ~ 0 -> starts == drafter
+                nn.init.constant_(self.gate_proj.bias, gate_bias_init)  # -5: g~0 (==drafter); 0: g~0.5
             else:
                 gate0 = torch.full((1,), float(residual_gate_init))
                 if freeze_residual_gate:
@@ -389,6 +395,7 @@ class OnlineDFlashRefiner(nn.Module):
         gate_type: str = "scalar",
         zero_init_oproj: bool = False,
         gate_floor: float = 0.0,
+        gate_bias_init: float = -5.0,
     ):
         super().__init__()
         self.feature_extractor = feature_extractor
@@ -412,6 +419,7 @@ class OnlineDFlashRefiner(nn.Module):
             block_size=self.block_size,
             zero_init_oproj=zero_init_oproj,
             gate_floor=gate_floor,
+            gate_bias_init=gate_bias_init,
         )
 
         # freeze everything except the refiner
