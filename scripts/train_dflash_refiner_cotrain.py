@@ -137,15 +137,22 @@ def parse_args():
     )
     refiner_group.add_argument(
         "--zero-init-oproj", action="store_true",
-        help="Stability route 1 (entry fix): zero-init the attention o_proj so the attention "
-        "sublayer starts as a no-op; the cross-position mixing grows in from 0 instead of "
-        "injecting harmful random scramble at step 0. Attention mixer only (no-op for sgu).",
+        help="Stability route 1 (entry fix): zero-init the o_proj of EVERY randomly-init "
+        "data-dependent attention module — the attention mixer AND the xattn pool — so each "
+        "starts as a no-op and grows in from 0 instead of injecting harmful random scramble at "
+        "step 0 (which slams the perpos gate shut). No-op for sgu mixer / mean pool.",
     )
     refiner_group.add_argument(
         "--gate-floor", type=float, default=0.0,
         help="Stability route 2 (trap fix): perpos gate floor eps in g = eps + (1-eps)*sigmoid(w.h). "
         "Keeps g>=eps so the mixer's gradient (~g) is never throttled to 0 (breaks gate-collapse). "
         "0.0 = off (current behavior); try 0.1.",
+    )
+    refiner_group.add_argument(
+        "--gate-bias-init", type=float, default=-5.0,
+        help="Stability route 3 (soft start): perpos gate bias init. -5.0 => g~0 (starts == drafter, "
+        "but mutes the mixer's early gradient); 0.0 => g~0.5 (strong early gradient so the mixer can "
+        "learn before the gate shuts; accept an initial score drop). No floor — gate may still close.",
     )
 
     dataset_group = parser.add_argument_group("dataset")
@@ -278,6 +285,7 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
                 "gate_type": args.gate_type,
                 "zero_init_oproj": args.zero_init_oproj,
                 "gate_floor": args.gate_floor,
+                "gate_bias_init": args.gate_bias_init,
                 "refiner_state_dict": refiner_state_dict,
                 "draft_state_dict": draft_state_dict,
                 # Scheduler is REPLICATED across ranks -> store it in the rank-0 file.
@@ -439,6 +447,7 @@ def main():
         gate_type=args.gate_type,
         zero_init_oproj=args.zero_init_oproj,
         gate_floor=args.gate_floor,
+        gate_bias_init=args.gate_bias_init,
     ).cuda()
     refiner_model.refiner = refiner_model.refiner.to(torch.bfloat16)
     if int(os.environ.get("RANK", "0")) == 0:
@@ -447,7 +456,8 @@ def main():
             f"  mixer_type   = {args.mixer_type}        (attention | sgu)\n"
             f"  pool_type    = {args.pool_type}         (mean | xattn)\n"
             f"  gate_type    = {args.gate_type}         (scalar | perpos)  use_residual_gate={args.use_residual_gate}\n"
-            f"  zero_init_oproj = {args.zero_init_oproj}   gate_floor = {args.gate_floor}   (stability knobs)\n"
+            f"  zero_init_oproj = {args.zero_init_oproj}   gate_floor = {args.gate_floor}   "
+            f"gate_bias_init = {args.gate_bias_init}   (stability knobs)\n"
             f"  window_size  = {args.window_size}   num_refiner_layers = {args.num_refiner_layers}   "
             f"mlp_intermediate = {getattr(args, 'mlp_intermediate', None)}\n"
             f"  lambda_base  = {args.lambda_base_start}->0 (ratio {args.lambda_base_decay_ratio})   "
