@@ -178,7 +178,8 @@ class RefinerLayer(nn.Module):
     """One refiner layer. mixer_type='attention' = Qwen3-style causal self-attn (+ optional window);
     mixer_type='sgu' = channel-wise lower-triangular causal mix (cheap, fixed, block-internal only)."""
 
-    def __init__(self, config, mlp_intermediate=None, mixer_type="attention", block_size=16):
+    def __init__(self, config, mlp_intermediate=None, mixer_type="attention", block_size=16,
+                 zero_init_oproj=False):
         super().__init__()
         H = config.hidden_size
         self.mixer_type = mixer_type
@@ -196,6 +197,13 @@ class RefinerLayer(nn.Module):
             self.o_proj = nn.Linear(self.n_heads * self.head_dim, H, bias=config.attention_bias)
             self.q_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
             self.k_norm = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            if zero_init_oproj:
+                # Start the attention sublayer as a no-op (out = residual + o_proj(attn) = residual).
+                # The cross-position scramble grows in from 0 instead of injecting harmful random
+                # mixing at step 0 -> avoids the per-position gate slamming shut (entry-side fix).
+                nn.init.zeros_(self.o_proj.weight)
+                if self.o_proj.bias is not None:
+                    nn.init.zeros_(self.o_proj.bias)
         # MLP cost = 3 * H * intermediate; mlp_intermediate=None -> default; >0 -> shrink; <=0 -> drop.
         if mlp_intermediate is not None and mlp_intermediate <= 0:
             self.mlp = None
@@ -270,6 +278,8 @@ class RefinerDecoder(nn.Module):
         pool_type: str = "mean",         # "mean" | "xattn" (cross-attention pool over dflash set)
         gate_type: str = "scalar",       # "scalar" (global ReZero) | "perpos" (input-dependent sigma(w.h))
         block_size: int = 16,
+        zero_init_oproj: bool = False,   # zero-init attention o_proj (attention sublayer starts as no-op)
+        gate_floor: float = 0.0,         # perpos gate floor: g = eps + (1-eps)*sigmoid(w.h), keeps g>=eps
     ):
         super().__init__()
         H = config.hidden_size
@@ -278,6 +288,7 @@ class RefinerDecoder(nn.Module):
         self.mixer_type = mixer_type
         self.pool_type = pool_type
         self.gate_type = gate_type
+        self.gate_floor = float(gate_floor)
         self.in_proj = nn.Linear(3 * H, H, bias=False)
         if window_size > 0:
             self.window_in_proj = nn.Linear(ctx_dim, H, bias=False)
@@ -287,7 +298,8 @@ class RefinerDecoder(nn.Module):
         self.rotary_emb = Qwen3RotaryEmbedding(config)
         self.layers = nn.ModuleList(
             [RefinerLayer(config, mlp_intermediate=mlp_intermediate,
-                          mixer_type=mixer_type, block_size=block_size) for _ in range(num_layers)]
+                          mixer_type=mixer_type, block_size=block_size,
+                          zero_init_oproj=zero_init_oproj) for _ in range(num_layers)]
         )
         self.norm = Qwen3RMSNorm(H, eps=config.rms_norm_eps)
         # Residual gate: out = h + gate * correction.
@@ -344,6 +356,10 @@ class RefinerDecoder(nn.Module):
             # out = h + gate * correction; gate starts ~0 => == drafter
             if self.gate_type == "perpos":
                 gate = torch.sigmoid(self.gate_proj(h))        # (BN, block, 1) input-dependent
+                if self.gate_floor > 0.0:
+                    # g = eps + (1-eps)*sigma; g never reaches 0, so the mixer's gradient
+                    # (d loss / d Mix ~ g) is never throttled -> breaks the gate-collapse trap.
+                    gate = self.gate_floor + (1.0 - self.gate_floor) * gate
             else:
                 gate = self.residual_gate
             out = h + gate * out
@@ -371,6 +387,8 @@ class OnlineDFlashRefiner(nn.Module):
         mixer_type: str = "attention",
         pool_type: str = "mean",
         gate_type: str = "scalar",
+        zero_init_oproj: bool = False,
+        gate_floor: float = 0.0,
     ):
         super().__init__()
         self.feature_extractor = feature_extractor
@@ -392,6 +410,8 @@ class OnlineDFlashRefiner(nn.Module):
             pool_type=pool_type,
             gate_type=gate_type,
             block_size=self.block_size,
+            zero_init_oproj=zero_init_oproj,
+            gate_floor=gate_floor,
         )
 
         # freeze everything except the refiner
