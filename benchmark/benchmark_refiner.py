@@ -38,24 +38,49 @@ def cuda_time() -> float:
 
 
 def load_refiner(refiner_path: str, draft_model: DFlashDraftModel, device):
-    """Rebuild RefinerDecoder from a train_dflash_refiner.py checkpoint and load weights."""
+    """Rebuild RefinerDecoder from a refiner / refiner_cotrain checkpoint and load weights.
+
+    Architecture-aware: reads mixer_type / pool_type / gate_type / gate_floor from the checkpoint
+    (so sgu / xattn / per-position-gate / gate-floor checkpoints reconstruct correctly). Falls back
+    to sniffing the state_dict keys for older checkpoints that predate those metadata fields.
+    """
     ckpt = torch.load(refiner_path, map_location="cpu", weights_only=False)
     sd = ckpt["refiner_state_dict"]
     window_size = int(ckpt.get("window_size", 0))
     num_layers = int(ckpt.get("num_refiner_layers", 1))
-    use_gate = any(k == "residual_gate" or k.endswith(".residual_gate") for k in sd)
+    mlp_intermediate = ckpt.get("mlp_intermediate", None)
+    block_size = draft_model.block_size  # ChannelWiseCausalMix L is (H, block, block) -> must match
+
+    # gate: the refiner's TOP-LEVEL gate params -- perpos -> gate_proj.{weight,bias}; scalar ->
+    # residual_gate. MUST use the top-level prefix so we DON'T match the MLP's own
+    # layers.*.mlp.gate_proj.* (which would falsely flag every checkpoint as gated).
+    has_perpos = any(k.startswith("gate_proj.") for k in sd)
+    has_scalar = any(k == "residual_gate" or k.endswith(".residual_gate") for k in sd)
+    use_gate = has_perpos or has_scalar
+    # prefer ckpt metadata; fall back to key-sniffing for old checkpoints
+    mixer_type = ckpt.get("mixer_type") or ("sgu" if any(".mix_out." in k for k in sd) else "attention")
+    pool_type = ckpt.get("pool_type") or ("xattn" if any(k.startswith("pool.") for k in sd) else "mean")
+    gate_type = ckpt.get("gate_type") or ("perpos" if has_perpos else "scalar")
+    gate_floor = float(ckpt.get("gate_floor", 0.0))  # forward-affecting -> MUST match training
+
     refiner = RefinerDecoder(
         draft_model.config,
         draft_model.fc.in_features,
         window_size=window_size,
         num_layers=num_layers,
         use_residual_gate=use_gate,
+        mlp_intermediate=mlp_intermediate,
+        mixer_type=mixer_type,
+        pool_type=pool_type,
+        gate_type=gate_type,
+        gate_floor=gate_floor,
+        block_size=block_size,
     )
     refiner.load_state_dict(sd, strict=True)
     refiner = refiner.to(device).to(torch.bfloat16).eval()
     print(
-        f"Loaded refiner: layers={num_layers}, window={window_size}, gate={use_gate}, "
-        f"step={ckpt.get('global_step')}"
+        f"Loaded refiner: mixer={mixer_type} pool={pool_type} gate={gate_type} floor={gate_floor} "
+        f"layers={num_layers} window={window_size} step={ckpt.get('global_step')}"
     )
     return refiner
 
@@ -74,6 +99,8 @@ def dflash_generate(
     refine_mode: str = "ar",        # "ar" | "parallel" | "conf" (confidence-gated)
     refine_passes: int = 1,
     conf_threshold: float = 0.9,
+    trust_prefix: int = 0,          # parallel: trust the first `trust_prefix` drafter tokens (fix them),
+                                    # Jacobi-refine only the suffix -> shorter dependency chains -> fewer passes
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -174,15 +201,18 @@ def dflash_generate(
                         conf = torch.where(upd, new_conf, conf)
                         frozen = conf >= conf_threshold                            # newly-confident positions freeze
                 else:
-                    # parallel co-refine: seed prev with the drafter's own block, refine all
-                    # positions at once; refine_passes passes propagate corrections.
+                    # parallel co-refine: seed the whole block from the drafter, then Jacobi-refine.
+                    # trust_prefix>0: KEEP the first `trust_prefix` drafted tokens fixed (trusted) and
+                    # only re-predict the suffix -> the suffix's AR context (the trusted prefix) is fixed
+                    # -> shorter dependency chains -> converges in fewer passes.
                     blk[:, 1:] = sample(target.lm_head(draft_hidden[:, -block_size + 1 :, :]), temperature)
+                    s = 1 + max(0, min(trust_prefix, block_size - 1))   # first refined column (skip trusted)
                     for _ in range(refine_passes):
                         prev = blk.roll(shifts=1, dims=1)
                         prev[:, 0] = tok_am1
                         prev_emb = target.model.embed_tokens(prev)
                         refined = refiner(h, g, prev_emb, window_hidden, window_mask)  # [1, L, H]
-                        blk[:, 1:] = sample(target.lm_head(refined[:, 1:, :]), temperature)
+                        blk[:, s:] = sample(target.lm_head(refined[:, s:, :]), temperature)
                 block_output_ids[:, 1:] = blk[:, 1:]
 
             if draft_prefill:
@@ -257,6 +287,10 @@ def main() -> None:
         help="comma list: drafter | ar | par<K> (parallel overwrite-all) | conf<K> (confidence-gated). e.g. drafter,par3,conf3",
     )
     parser.add_argument("--conf-threshold", type=float, default=0.9, help="keep tokens with confidence >= this (conf mode)")
+    parser.add_argument("--trust-prefix", type=int, default=0,
+                        help="parallel/par modes: TRUST the first N drafter tokens (keep them fixed) and "
+                        "Jacobi-refine only the suffix. Global -> applies to all par modes. Sweep across "
+                        "runs (0,1,2,3) to find how many drafter tokens are reliable enough to skip refining.")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -350,6 +384,7 @@ def main() -> None:
                         block_size=bs, stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature, refiner=rf, refine_mode=rmode, refine_passes=rpasses,
                         conf_threshold=args.conf_threshold,
+                        trust_prefix=args.trust_prefix,
                     )
                 key = next((n for n, _, rf, _, _ in modes if rf is not None), "drafter")
                 gen = response[key].output_ids[0, response[key].num_input_tokens :]
