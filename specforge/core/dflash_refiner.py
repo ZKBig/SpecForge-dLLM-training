@@ -250,6 +250,39 @@ class RefinerLayer(nn.Module):
         return x
 
 
+class LowRankReadout(nn.Module):
+    """Low-rank approximation of lm_head applied to the refinement DELTA (refined - h).
+
+    lm_head is linear, so  lm_head(refined) = lm_head(h) + lm_head(refined - h)  exactly.
+    We keep the base term lm_head(h) (already computed for the drafter) at FULL precision and
+    approximate the second term with a learned H->r->V factorization. Only the SMALL delta is
+    low-ranked, so argmax is preserved -- unlike low-ranking the full logits (which fails). With
+    SVD warm-start, up @ down ~= lm_head at init, so the readout starts ~equivalent to full.
+    """
+
+    def __init__(self, hidden_size, vocab_size, rank):
+        super().__init__()
+        self.rank = rank
+        self.down = nn.Linear(hidden_size, rank, bias=False)
+        self.up = nn.Linear(rank, vocab_size, bias=False)
+        nn.init.zeros_(self.up.weight)   # correction starts at 0 => readout == base (drafter) at step 0
+
+    def forward(self, delta):            # delta: (..., H) -> (..., V)
+        return self.up(self.down(delta))
+
+    @torch.no_grad()
+    def svd_init_from(self, weight):
+        """Warm-start so up @ down ~= weight (the frozen lm_head). weight: (V, H)."""
+        r = self.rank
+        W = weight.detach().float()
+        # randomized top-r SVD: A ~= U diag(S) V^T  (cheap; only the leading r components)
+        U, S, V = torch.svd_lowrank(W, q=min(r + 16, min(W.shape)), niter=4)
+        Ur, Sr, Vr = U[:, :r], S[:r].clamp(min=0), V[:, :r]
+        sqrt_s = Sr.sqrt()
+        self.down.weight.copy_((sqrt_s[:, None] * Vr.t()).to(self.down.weight))   # (r, H), match dev+dtype
+        self.up.weight.copy_((Ur * sqrt_s[None, :]).to(self.up.weight))           # (V, r), match dev+dtype
+
+
 class RefinerDecoder(nn.Module):
     """AR refiner head. Consumes the drafter's per-block hiddens and produces refined
     hidden states for each block position.
@@ -290,6 +323,9 @@ class RefinerDecoder(nn.Module):
         self.pool_type = pool_type
         self.gate_type = gate_type
         self.gate_floor = float(gate_floor)
+        # Optional low-rank lm-head correction; attached by OnlineDFlashRefiner (needs lm_head
+        # for SVD init). None => readout uses the full frozen lm_head (default, unchanged).
+        self.lowrank_head = None
         self.in_proj = nn.Linear(3 * H, H, bias=False)
         if window_size > 0:
             self.window_in_proj = nn.Linear(ctx_dim, H, bias=False)
@@ -329,6 +365,7 @@ class RefinerDecoder(nn.Module):
         prev_emb: torch.Tensor,
         window_hidden: Optional[torch.Tensor] = None,
         window_mask: Optional[torch.Tensor] = None,
+        return_correction: bool = False,
     ) -> torch.Tensor:
         bn, block, _ = h.shape
         device = h.device
@@ -369,6 +406,11 @@ class RefinerDecoder(nn.Module):
             else:
                 gate = self.residual_gate
             out = h + gate * out
+        if return_correction:
+            # low-rank lm-head correction, computed INSIDE forward so FSDP has all-gathered
+            # the head's params. corr ~= lm_head(out - h); caller adds base lm_head(h).
+            corr = self.lowrank_head(out - h) if self.lowrank_head is not None else None
+            return out, corr
         return out
 
 
@@ -396,6 +438,8 @@ class OnlineDFlashRefiner(nn.Module):
         zero_init_oproj: bool = False,
         gate_floor: float = 0.0,
         gate_bias_init: float = -5.0,
+        lowrank_rank: int = 0,
+        lowrank_init: str = "svd",
     ):
         super().__init__()
         self.feature_extractor = feature_extractor
@@ -422,9 +466,32 @@ class OnlineDFlashRefiner(nn.Module):
             gate_bias_init=gate_bias_init,
         )
 
+        # Optional low-rank lm-head correction head (Domino-style base + low-rank Delta).
+        # Built here (not in RefinerDecoder) because SVD warm-start needs the frozen lm_head;
+        # attaching to self.refiner keeps it inside the FSDP-wrapped + checkpointed module.
+        if lowrank_rank and lowrank_rank > 0:
+            H = config.hidden_size
+            V = feature_extractor.lm_head.weight.shape[0]
+            head = LowRankReadout(H, V, lowrank_rank)
+            if lowrank_init == "svd":
+                head.svd_init_from(feature_extractor.lm_head.weight)
+            self.refiner.lowrank_head = head
+
         # freeze everything except the refiner
         for p in self.feature_extractor.parameters():
             p.requires_grad = False
+
+    def _refine_and_readout(self, h, g, prev_emb, window_hidden, window_mask):
+        """Run the refiner and read out logits. With a low-rank head the correction is computed
+        INSIDE refiner.forward (FSDP-safe), then base lm_head(h) is added here; else full lm_head."""
+        fe = self.feature_extractor
+        if self.refiner.lowrank_head is not None:
+            refined, corr = self.refiner(
+                h, g, prev_emb, window_hidden, window_mask, return_correction=True
+            )
+            return refined, fe.lm_head(h) + corr
+        refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
+        return refined, fe.lm_head(refined)
 
     def _gather_window(self, hidden_states, anchor_positions, seq_len, B, n):
         """Gather the W target hiddens before each anchor: [a-W, ..., a-1]."""
@@ -468,8 +535,9 @@ class OnlineDFlashRefiner(nn.Module):
                 hidden_states, f.anchor_positions, f.seq_len, B, n
             )
 
-        refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
-        logits = fe.lm_head(refined)  # (BN, block, V)
+        refined, logits = self._refine_and_readout(
+            h, g, prev_emb, window_hidden, window_mask
+        )  # (BN, block, V); low-rank corrected if enabled
 
         flat_logits = logits.reshape(-1, logits.size(-1))
         flat_tgt = tgt.reshape(-1)
@@ -528,9 +596,12 @@ class OnlineDFlashRefiner(nn.Module):
             accept = match.float().cumprod(dim=1).sum(dim=1)
             return (accept * keep).sum() / keep.sum().clamp(min=1.0)
 
-        # drafter baseline: parallel argmax, no AR
-        drafter_pred = fe.lm_head(h).argmax(dim=-1)  # [BN, block]
+        # drafter baseline: parallel argmax, no AR. base_logits = lm_head(h) computed ONCE and
+        # reused as the low-rank readout's base (so each AR pass below only adds a cheap correction).
+        base_logits = fe.lm_head(h)  # [BN, block, V]
+        drafter_pred = base_logits.argmax(dim=-1)
         drafter_accept = _accept(drafter_pred)
+        lowrank = self.refiner.lowrank_head
 
         # refiner: free-running greedy AR (slot 0 stays the real anchor)
         window_hidden = window_mask = None
@@ -546,8 +617,16 @@ class OnlineDFlashRefiner(nn.Module):
             prev_tok = pred.roll(shifts=1, dims=1)
             prev_tok[:, 0] = tok_am1
             prev_emb = fe.embed_tokens(prev_tok)
-            refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
-            pred[:, k] = fe.lm_head(refined[:, k, :]).argmax(dim=-1)
+            if lowrank is not None:
+                # correction computed INSIDE refiner.forward (FSDP-safe); base added from base_logits
+                _, corr = self.refiner(
+                    h, g, prev_emb, window_hidden, window_mask, return_correction=True
+                )
+                logit_k = base_logits[:, k, :] + corr[:, k, :]
+            else:
+                refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
+                logit_k = fe.lm_head(refined[:, k, :])
+            pred[:, k] = logit_k.argmax(dim=-1)
         refiner_accept = _accept(pred)
 
         return refiner_accept, drafter_accept

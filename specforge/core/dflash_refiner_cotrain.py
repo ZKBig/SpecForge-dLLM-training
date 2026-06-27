@@ -100,9 +100,18 @@ class OnlineDFlashRefinerCoTrain(OnlineDFlashRefiner):
                 hidden_states, f.anchor_positions, f.seq_len, B, n
             )
 
-        refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
-        refined_logits = fe.lm_head(refined).reshape(-1, fe.lm_head.weight.size(0))
-        base_logits = fe.lm_head(h).reshape(-1, fe.lm_head.weight.size(0))  # gate=0 drafter prediction
+        V = fe.lm_head.weight.size(0)
+        base_3d = fe.lm_head(h)  # (BN, block, V); gate=0 drafter prediction
+        if self.refiner.lowrank_head is not None:
+            # correction computed INSIDE refiner.forward (FSDP-safe); reuse base_3d (1 full lm_head).
+            refined, corr = self.refiner(
+                h, g, prev_emb, window_hidden, window_mask, return_correction=True
+            )
+            refined_logits = (base_3d + corr).reshape(-1, V)
+        else:
+            refined = self.refiner(h, g, prev_emb, window_hidden, window_mask)
+            refined_logits = fe.lm_head(refined).reshape(-1, V)
+        base_logits = base_3d.reshape(-1, V)
 
         flat_tgt = tgt.reshape(-1)
         valid = f.binary_mask  # (B, n, block) 0/1
