@@ -87,6 +87,21 @@ def parse_args():
     )
     refiner_group.add_argument("--num-refiner-layers", type=int, default=1)
     refiner_group.add_argument(
+        "--mlp-intermediate", type=int, default=None,
+        help="Refiner MLP intermediate size. None = Qwen3 default (full); >0 = shrink to this; "
+        "<=0 = drop the MLP entirely. For MLP-size ablation / cost reduction.",
+    )
+    refiner_group.add_argument(
+        "--lowrank-lmhead-rank", type=int, default=0,
+        help="If >0, read out as base lm_head(h) + low-rank(refined-h) with this rank (Domino-style "
+        "base+correction; only the small delta is low-ranked so argmax is preserved). 0 = full lm_head.",
+    )
+    refiner_group.add_argument(
+        "--lowrank-lmhead-init", type=str, default="svd", choices=["svd", "zero"],
+        help="Low-rank head init: 'svd' = warm-start so up@down ~= lm_head (starts ~equivalent to "
+        "full); 'zero' = correction starts at 0 (readout == drafter at step 0).",
+    )
+    refiner_group.add_argument(
         "--use-residual-gate",
         action="store_true",
         help="Refine via a gated residual on the drafter hidden "
@@ -286,6 +301,9 @@ def save_checkpoint(args, epoch, step, refiner_fsdp, draft_fsdp, optimizer):
                 "zero_init_oproj": args.zero_init_oproj,
                 "gate_floor": args.gate_floor,
                 "gate_bias_init": args.gate_bias_init,
+                "mlp_intermediate": args.mlp_intermediate,
+                "lowrank_lmhead_rank": args.lowrank_lmhead_rank,
+                "lowrank_lmhead_init": args.lowrank_lmhead_init,
                 "refiner_state_dict": refiner_state_dict,
                 "draft_state_dict": draft_state_dict,
                 # Scheduler is REPLICATED across ranks -> store it in the rank-0 file.
@@ -448,6 +466,9 @@ def main():
         zero_init_oproj=args.zero_init_oproj,
         gate_floor=args.gate_floor,
         gate_bias_init=args.gate_bias_init,
+        mlp_intermediate=args.mlp_intermediate,
+        lowrank_rank=args.lowrank_lmhead_rank,
+        lowrank_init=args.lowrank_lmhead_init,
     ).cuda()
     refiner_model.refiner = refiner_model.refiner.to(torch.bfloat16)
     if int(os.environ.get("RANK", "0")) == 0:
