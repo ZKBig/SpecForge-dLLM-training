@@ -1,7 +1,8 @@
 """Dataset accept benchmark with a LOW-RANK lm-head readout -- does low-rank readout drop accept?
 
-SELF-CONTAINED (does not import benchmark_refiner.py). Same dataset / refine-mode / checkpoint
-flow, plus one knob: --lowrank-rank, which switches the refiner's readout
+SELF-CONTAINED + NO CUDA GRAPH (IBM-safe: based on benchmark_refiner_no_cuda_graph.py, no
+cudagraph_target import / RefinerParKGraph / graphed verify). Same dataset / refine-mode /
+checkpoint flow, plus one knob: --lowrank-rank, which switches the refiner's readout
     lm_head(refined)  ->  base lm_head(h) + low-rank(refined - h)
 
   --lowrank-rank 0    full lm_head (baseline accept)
@@ -13,14 +14,12 @@ Run the SAME checkpoint + datasets at rank 0 and rank R and read off the accept 
 
   torchrun --nproc_per_node=8 benchmark/benchmark_lowrank_lmhead.py \
      --dataset gsm8k,humaneval,math500 --max-samples 128 \
-     --model-name-or-path /gpfs/zwang33/models/Qwen3-8B \
-     --draft-name-or-path z-lab/Qwen3-8B-DFlash-b16 \
+     --model-name-or-path /gpfs/zwang33/models/Qwen3-8B --draft-name-or-path z-lab/Qwen3-8B-DFlash-b16 \
      --refiner-path /gpfs/.../refiner_cotrain.pt \
      --refine-modes drafter,ar,par1,par2,par3 --max-new-tokens 1024 --temperature 0.0 \
      --lowrank-rank 256          # <- 0 for the full-lm_head baseline run
 
-NOTE: needs specforge importable -> `pip install -e` the SpecForge fork in this env.
-window_size=0 refiners only. --lowrank-rank is not supported with --graph-refiner (eager only).
+NOTE: needs specforge importable. window_size=0 refiners only.
 """
 import argparse
 import os
@@ -50,9 +49,6 @@ def _readout(refiner, lm_head, refined, h):
     if lr is not None:
         return lm_head(h) + lr(refined - h)
     return lm_head(refined)
-
-# CUDA-graphed target (Phase A: baseline only)
-from cudagraph_target import GraphedDecoder, baseline_generate_graphed
 
 
 def cuda_time() -> float:
@@ -99,9 +95,8 @@ def load_refiner(refiner_path: str, draft_model: DFlashDraftModel, device):
         gate_floor=gate_floor,
         block_size=block_size,
     )
-    # TRAINED low-rank head (if the checkpoint has one) -> build it before the strict load so
-    # the lowrank_head.* keys match. (Post-hoc SVD heads for full-lm_head checkpoints are attached
-    # later in main() from --lowrank-rank.)
+    # TRAINED low-rank head (if the checkpoint has one) -> build before the strict load so the
+    # lowrank_head.* keys match. (Post-hoc SVD heads for full-lm_head checkpoints attach in main().)
     if any(k.startswith("lowrank_head.") for k in sd):
         V, r = sd["lowrank_head.up.weight"].shape          # up: [vocab, rank]
         refiner.lowrank_head = LowRankReadout(draft_model.config.hidden_size, int(V), int(r))
@@ -113,59 +108,6 @@ def load_refiner(refiner_path: str, draft_model: DFlashDraftModel, device):
         f"layers={num_layers} window={window_size} step={ckpt.get('global_step')}"
     )
     return refiner
-
-
-class RefinerParKGraph:
-    """CUDA-graphed par-K refiner block decode — minimizes the refiner's per-block overhead
-    WITHOUT changing its structure/weights (greedy/argmax only). Captures `seed + K passes` of
-    (roll -> embed -> refiner -> lm_head -> argmax) over a FIXED block with static input buffers,
-    so the K-pass rollout replays as one graph (no per-step launch overhead). Per-block-varying
-    inputs (h, tok_am1, window) are copied into the static buffers before each replay.
-
-    Note: the refiner forward (attention + MLP) is real compute, so the graph mainly removes
-    launch overhead (~1.1-1.2x on the refiner); the MLP FLOPs are irreducible without retraining.
-    """
-
-    def __init__(self, refiner, lm_head, embed, block_size, K, ctx_dim, device, dtype):
-        self.K = K
-        self.block_size = block_size
-        self.W = refiner.window_size
-        H = lm_head.weight.shape[1]
-        self.h = torch.zeros(1, block_size, H, device=device, dtype=dtype)
-        self.tok_am1 = torch.zeros(1, dtype=torch.long, device=device)
-        self.win_h = torch.zeros(1, self.W, ctx_dim, device=device, dtype=dtype) if self.W > 0 else None
-        self.win_m = torch.ones(1, self.W, dtype=torch.bool, device=device) if self.W > 0 else None
-        self.blk = torch.zeros(1, block_size, dtype=torch.long, device=device)
-
-        def _decode():
-            h = self.h
-            g = h.mean(dim=1, keepdim=True).expand(-1, block_size, -1)
-            self.blk[:, 1:] = lm_head(h[:, 1:, :]).argmax(dim=-1)          # seed = drafter's own block
-            for _ in range(K):
-                prev = self.blk.roll(shifts=1, dims=1)
-                prev[:, 0] = self.tok_am1
-                refined = refiner(h, g, embed(prev), self.win_h, self.win_m)
-                self.blk[:, 1:] = lm_head(refined[:, 1:, :]).argmax(dim=-1)
-
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                _decode()
-        torch.cuda.current_stream().wait_stream(s)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            _decode()
-
-    @torch.inference_mode()
-    def __call__(self, h, tok_am1, window_hidden, window_mask):
-        self.h.copy_(h)
-        self.tok_am1.copy_(tok_am1.reshape(1))
-        if self.win_h is not None:
-            self.win_h.copy_(window_hidden)
-            self.win_m.copy_(window_mask)
-        self.graph.replay()
-        return self.blk[:, 1:].clone()
 
 
 @torch.inference_mode()
@@ -182,8 +124,8 @@ def dflash_generate(
     refine_mode: str = "ar",        # "ar" | "parallel" | "conf" (confidence-gated)
     refine_passes: int = 1,
     conf_threshold: float = 0.9,
-    graphed_verify=None,            # GraphedDecoder(q_len=block_size, need_hidden=True) for CUDA-graphed verify
-    refiner_graph=None,             # RefinerParKGraph -> CUDA-graphed par-K refine (parallel mode, greedy)
+    trust_prefix: int = 0,          # parallel: trust the first `trust_prefix` drafter tokens (fix them),
+                                    # Jacobi-refine only the suffix -> shorter dependency chains -> fewer passes
 ) -> SimpleNamespace:
     num_input_tokens = input_ids.shape[1]
     max_length = num_input_tokens + max_new_tokens
@@ -199,20 +141,16 @@ def dflash_generate(
 
     # Prefill
     prefill_start = cuda_time()
-    if graphed_verify is not None:
-        graphed_verify.reset()
-        output = graphed_verify.prefill(input_ids, position_ids[:, :num_input_tokens])
-    else:
-        output = target(
-            input_ids,
-            position_ids=position_ids[:, :num_input_tokens],
-            past_key_values=past_key_values_target,
-            use_cache=True,
-            logits_to_keep=1,
-            output_hidden_states=True if block_size > 1 else False,
-        )
+    output = target(
+        input_ids,
+        position_ids=position_ids[:, :num_input_tokens],
+        past_key_values=past_key_values_target,
+        use_cache=True,
+        logits_to_keep=1,
+        output_hidden_states=True if block_size > 1 else False,
+    )
     output_ids[:, :num_input_tokens] = input_ids
-    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits[:, -1:, :], temperature)
+    output_ids[:, num_input_tokens : num_input_tokens + 1] = sample(output.logits, temperature)
     if block_size > 1:
         target_hidden = extract_context_feature(output.hidden_states, model.target_layer_ids)
         if W > 0:
@@ -228,10 +166,6 @@ def dflash_generate(
     start = input_ids.shape[1]
     acceptance_lengths = []
     draft_prefill = True
-    stop_tensor = (
-        torch.tensor(stop_token_ids, device=model.device) if stop_token_ids is not None else None
-    )
-    checked = start  # cursor: output_ids positions < checked already scanned for stop tokens
 
     while start < max_length:
         block_output_ids = output_ids[:, start : start + block_size].clone()
@@ -276,7 +210,7 @@ def dflash_generate(
                         )[:, 0]
                 elif refine_mode == "conf":
                     # confidence-gated: trust high-confidence tokens (drafter's, then refiner's),
-                    # re-predict ONLY the uncertain ones over refine_passes passes[].
+                    # re-predict ONLY the uncertain ones over refine_passes passes.
                     dlogits = target.lm_head(draft_hidden[:, -block_size + 1 :, :])
                     blk[:, 1:] = sample(dlogits, temperature)
                     conf = torch.ones(1, block_size, device=model.device)          # [1, L]; anchor frozen
@@ -295,20 +229,20 @@ def dflash_generate(
                         blk = torch.where(upd, new_tok, blk)
                         conf = torch.where(upd, new_conf, conf)
                         frozen = conf >= conf_threshold                            # newly-confident positions freeze
-                elif refiner_graph is not None:
-                    # CUDA-graphed par-K (greedy): one graph replay = seed + K passes, no launch overhead
-                    blk[:, 1:] = refiner_graph(h, tok_am1, window_hidden, window_mask)
                 else:
-                    # parallel co-refine: seed prev with the drafter's own block, refine all
-                    # positions at once; refine_passes passes propagate corrections.
+                    # parallel co-refine: seed the whole block from the drafter, then Jacobi-refine.
+                    # trust_prefix>0: KEEP the first `trust_prefix` drafted tokens fixed (trusted) and
+                    # only re-predict the suffix -> the suffix's AR context (the trusted prefix) is fixed
+                    # -> shorter dependency chains -> converges in fewer passes.
                     blk[:, 1:] = sample(target.lm_head(draft_hidden[:, -block_size + 1 :, :]), temperature)
+                    s = 1 + max(0, min(trust_prefix, block_size - 1))   # first refined column (skip trusted)
                     for _ in range(refine_passes):
                         prev = blk.roll(shifts=1, dims=1)
                         prev[:, 0] = tok_am1
                         prev_emb = target.model.embed_tokens(prev)
                         refined = refiner(h, g, prev_emb, window_hidden, window_mask)  # [1, L, H]
-                        blk[:, 1:] = sample(
-                            _readout(refiner, target.lm_head, refined[:, 1:, :], h[:, 1:, :]), temperature
+                        blk[:, s:] = sample(
+                            _readout(refiner, target.lm_head, refined[:, s:, :], h[:, s:, :]), temperature
                         )
                 block_output_ids[:, 1:] = blk[:, 1:]
 
@@ -316,20 +250,13 @@ def dflash_generate(
                 draft_prefill = False
                 decode_start = cuda_time()
 
-        if graphed_verify is not None:
-            graphed_verify.in_ids.copy_(block_output_ids)
-            graphed_verify.pos.copy_(block_position_ids)
-            graphed_verify.cache_pos.copy_(block_position_ids[0])
-            v_logits, v_hidden = graphed_verify.step()
-            output = SimpleNamespace(logits=v_logits, hidden_states=v_hidden)
-        else:
-            output = target(
-                block_output_ids,
-                position_ids=block_position_ids,
-                past_key_values=past_key_values_target,
-                use_cache=True,
-                output_hidden_states=True if block_size > 1 else False,
-            )
+        output = target(
+            block_output_ids,
+            position_ids=block_position_ids,
+            past_key_values=past_key_values_target,
+            use_cache=True,
+            output_hidden_states=True if block_size > 1 else False,
+        )
 
         posterior = sample(output.logits, temperature)
         acceptance_length = (
@@ -348,14 +275,12 @@ def dflash_generate(
 
         acceptance_lengths.append(acceptance_length + 1)
         start += acceptance_length + 1
-        if graphed_verify is None:
-            past_key_values_target.crop(start)  # StaticCache path rolls back via overwrite+mask, no crop
+        past_key_values_target.crop(start)
 
-        if stop_tensor is not None:
-            # only scan tokens written this step (positions [checked, start]); O(n) total, not O(n^2)
-            if torch.isin(output_ids[:, checked : start + 1], stop_tensor).any():
-                break
-            checked = start + 1
+        if stop_token_ids is not None and any(
+            stop_token_id in output_ids[:, num_input_tokens:] for stop_token_id in stop_token_ids
+        ):
+            break
 
     output_ids = output_ids[:, :max_length]
     output_ids = output_ids[:, output_ids[0] != mask_token_id]
@@ -395,16 +320,14 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--enable-thinking", action="store_true")
     parser.add_argument(
-        "--refine-modes", type=str, default="baseline,drafter,par1,par3",
+        "--refine-modes", type=str, default="drafter,par1,par3,conf3",
         help="comma list: drafter | ar | par<K> (parallel overwrite-all) | conf<K> (confidence-gated). e.g. drafter,par3,conf3",
     )
     parser.add_argument("--conf-threshold", type=float, default=0.9, help="keep tokens with confidence >= this (conf mode)")
-    parser.add_argument("--compile", action="store_true", help="torch.compile target/draft/refiner for optimized timing")
-    parser.add_argument("--cudagraph", action="store_true", help="CUDA-graph the target decode (Phase A: baseline only)")
-    parser.add_argument("--graph-refiner", action="store_true",
-                        help="CUDA-graph the par-K refiner decode (greedy, temp=0) — minimizes the refiner's "
-                        "per-block overhead without changing its structure. Applies to par<K> modes.")
-    parser.add_argument("--max-cache-len", type=int, default=4096, help="StaticCache length for --cudagraph (>= max prompt + max_new_tokens)")
+    parser.add_argument("--trust-prefix", type=int, default=0,
+                        help="parallel/par modes: TRUST the first N drafter tokens (keep them fixed) and "
+                        "Jacobi-refine only the suffix. Global -> applies to all par modes. Sweep across "
+                        "runs (0,1,2,3) to find how many drafter tokens are reliable enough to skip refining.")
     args = parser.parse_args()
 
     torch.manual_seed(0)
@@ -436,8 +359,6 @@ def main() -> None:
     refiner = load_refiner(args.refiner_path, draft_model, device) if args.refiner_path else None
 
     if args.lowrank_rank > 0 and refiner is not None:
-        if args.graph_refiner:
-            raise SystemExit("--lowrank-rank is not supported with --graph-refiner; use eager par/ar modes.")
         if getattr(refiner, "lowrank_head", None) is None:
             # full-lm_head checkpoint -> attach a POST-HOC SVD low-rank head (untrained approximation).
             H = draft_model.config.hidden_size
@@ -450,15 +371,6 @@ def main() -> None:
                       f"(untrained -> expect some accept drop)")
         elif dist.is_main():
             print(f"[lowrank] using TRAINED low-rank head from checkpoint")
-
-    if args.compile:
-        # optimized kernels for accurate latency/overhead measurement (first iters slow while compiling)
-        target = torch.compile(target)
-        draft_model = torch.compile(draft_model)
-        if refiner is not None:
-            refiner = torch.compile(refiner)
-        if dist.is_main():
-            print("[compile] torch.compile enabled — warmup iters will be slow")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
@@ -483,39 +395,6 @@ def main() -> None:
     if dist.is_main():
         print("running modes:", [m[0] for m in modes])
 
-    # CUDA-graph the par-K refiner decode (greedy). One graph per K -> {mode_name: RefinerParKGraph}.
-    refiner_graphs = {}
-    if args.graph_refiner and refiner is not None:
-        assert args.temperature == 0.0, "--graph-refiner is greedy (argmax); use --temperature 0.0"
-        assert not args.compile, "--graph-refiner and --compile are mutually exclusive"
-        ctx_dim = draft_model.fc.in_features
-        for name, bs, rf, rmode, rpasses in modes:
-            if rmode == "parallel" and rf is not None:
-                refiner_graphs[name] = RefinerParKGraph(
-                    rf, target.lm_head, target.model.embed_tokens,
-                    block_size, rpasses, ctx_dim, device, torch.bfloat16,
-                )
-        if dist.is_main():
-            print(f"[graph-refiner] captured par-K graphs for: {list(refiner_graphs)}")
-
-    # CUDA-graphed target. (mutually exclusive with --compile)
-    #   Phase A: plain-AR baseline (q_len=1).  Phase B1: block verify for spec modes (q_len=block_size).
-    graphed_baseline = None
-    graphed_verify = None
-    _printed_baseline = [False]  # one-shot coherence print
-    if args.cudagraph:
-        assert not args.compile, "--cudagraph and --compile are mutually exclusive"
-        torch.set_float32_matmul_precision("high")
-        if any(m[0] == "baseline" for m in modes):
-            graphed_baseline = GraphedDecoder(target, q_len=1, max_length=args.max_cache_len, device=device)
-            if dist.is_main():
-                print(f"[cudagraph] captured baseline decoder (max_cache_len={args.max_cache_len})")
-        if any(m[1] > 1 for m in modes):  # any speculative mode (block_size>1) -> graph the verify forward
-            graphed_verify = GraphedDecoder(target, q_len=block_size, max_length=args.max_cache_len,
-                                            device=device, need_hidden=True)
-            if dist.is_main():
-                print(f"[cudagraph] captured verify decoder (q_len={block_size}, need_hidden=True)")
-
     def load_ds(name):
         if name.endswith(".jsonl") or os.path.exists(name):
             import json
@@ -530,20 +409,6 @@ def main() -> None:
                             break
             return Dataset.from_list(rows)
         return load_and_process_dataset(name)
-
-    if args.compile:
-        # warmup each mode once so the timed loop measures compiled kernels, not compilation
-        warm_ids = tokenizer("Hello, world. Please answer briefly.", return_tensors="pt").input_ids.to(target.device)
-        for _name, bs, rf, rmode, rpasses in modes:
-            dflash_generate(
-                model=draft_model, target=target, input_ids=warm_ids,
-                mask_token_id=draft_model.mask_token_id, max_new_tokens=64,
-                block_size=bs, stop_token_ids=[tokenizer.eos_token_id],
-                temperature=args.temperature, refiner=rf, refine_mode=rmode, refine_passes=rpasses,
-                conf_threshold=args.conf_threshold,
-            )
-        if dist.is_main():
-            print("[compile] warmup done — timing now uses compiled kernels")
 
     # --dataset is a comma list: run each benchmark in turn
     for ds_name in [d.strip() for d in args.dataset.split(",") if d.strip()]:
@@ -564,28 +429,17 @@ def main() -> None:
                 input_ids = tokenizer.encode(input_text, return_tensors="pt").to(target.device)
                 response = {}
                 for name, bs, rf, rmode, rpasses in modes:
-                    if graphed_baseline is not None and name == "baseline":
-                        response[name] = baseline_generate_graphed(
-                            graphed_baseline, input_ids, max_new_tokens=args.max_new_tokens,
-                            stop_token_ids=[tokenizer.eos_token_id], temperature=args.temperature,
-                        )
-                        continue
                     response[name] = dflash_generate(
                         model=draft_model, target=target, input_ids=input_ids,
                         mask_token_id=draft_model.mask_token_id, max_new_tokens=args.max_new_tokens,
                         block_size=bs, stop_token_ids=[tokenizer.eos_token_id],
                         temperature=args.temperature, refiner=rf, refine_mode=rmode, refine_passes=rpasses,
                         conf_threshold=args.conf_threshold,
-                        graphed_verify=graphed_verify if bs > 1 else None,
-                        refiner_graph=refiner_graphs.get(name),
+                        trust_prefix=args.trust_prefix,
                     )
                 key = next((n for n, _, rf, _, _ in modes if rf is not None), "drafter")
                 gen = response[key].output_ids[0, response[key].num_input_tokens :]
                 messages.append({"role": "assistant", "content": tokenizer.decode(gen, skip_special_tokens=True)})
-                if graphed_baseline is not None and not _printed_baseline[0] and dist.is_main():
-                    _printed_baseline[0] = True
-                    bgen = response["baseline"].output_ids[0, response["baseline"].num_input_tokens :]
-                    print("\n[cudagraph baseline sample]\n" + tokenizer.decode(bgen, skip_special_tokens=True)[:600] + "\n")
                 local.append({n: {"acc": r.acceptance_lengths, "tpot": r.time_per_output_token}
                               for n, r in response.items()})
 
@@ -598,13 +452,7 @@ def main() -> None:
             recs = local
 
         print(f"\n========== RESULTS: {ds_name}  (n={len(recs)}) ==========")
-        # speedup reference: prefer the target AR baseline (block_size=1), else drafter
-        if any(m[0] == "baseline" for m in modes):
-            base = "baseline"
-        elif any(m[0] == "drafter" for m in modes):
-            base = "drafter"
-        else:
-            base = modes[0][0]
+        base = "drafter" if any(m[0] == "drafter" for m in modes) else modes[0][0]
         t_ref = np.mean([r[base]["tpot"] for r in recs])
         for name, _, _, _, _ in modes:
             t = np.mean([r[name]["tpot"] for r in recs])
