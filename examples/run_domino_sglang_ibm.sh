@@ -16,7 +16,7 @@ DRAFT=Huang2020/Qwen3-8B-Domino-b16
 PORT=30000
 OUT_DIR=/gpfs/zwang33/domino_out
 SERVER_LOG=$OUT_DIR/sglang_server.log
-MEASURE=/gpfs/zwang33/measure_dflash_latency.py
+MEASURE=scripts/measure_dflash_latency.py
 mkdir -p "$OUT_DIR"
 
 # ============================ 1. build the Domino sglang fork (cu128 path) ============================
