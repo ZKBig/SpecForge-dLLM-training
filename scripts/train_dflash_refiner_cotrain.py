@@ -102,6 +102,12 @@ def parse_args():
         "full); 'zero' = correction starts at 0 (readout == drafter at step 0).",
     )
     refiner_group.add_argument(
+        "--consistency-weight", type=float, default=0.0,
+        help="2-point consistency loss weight (CLLM-style). >0 adds CE on the refiner conditioned on "
+        "the drafter's SEED prev (the first Jacobi pass's real input) so it learns to converge in "
+        "fewer passes. Costs ~one extra refiner+lm_head per step. 0 = off. Try ~0.5.",
+    )
+    refiner_group.add_argument(
         "--use-residual-gate",
         action="store_true",
         help="Refine via a gated residual on the drafter hidden "
@@ -390,6 +396,18 @@ def main():
                 for s in self.streams:
                     s.flush()
 
+            def isatty(self):
+                # reflect the REAL underlying stream: wandb shows its progress bar when this
+                # runs in a terminal, and auto-suppresses it when output is piped to a file
+                # (where a dynamic \r/ANSI bar would just be log garbage). Without this method
+                # at all, wandb.init crashes with AttributeError on the _Tee.
+                return self.streams[0].isatty()
+
+            def __getattr__(self, name):
+                # delegate anything else (fileno, encoding, buffer, ...) to the real stream
+                # so libraries probing the stream don't hit AttributeError.
+                return getattr(self.streams[0], name)
+
         sys.stdout = _Tee(sys.stdout, _logf)
         sys.stderr = _Tee(sys.stderr, _logf)
         print(f"[tee] logging to {os.path.join(args.output_dir, 'train.log')}")
@@ -469,6 +487,7 @@ def main():
         mlp_intermediate=args.mlp_intermediate,
         lowrank_rank=args.lowrank_lmhead_rank,
         lowrank_init=args.lowrank_lmhead_init,
+        consistency_weight=args.consistency_weight,
     ).cuda()
     refiner_model.refiner = refiner_model.refiner.to(torch.bfloat16)
     if int(os.environ.get("RANK", "0")) == 0:
