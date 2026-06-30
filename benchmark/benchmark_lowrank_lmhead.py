@@ -356,10 +356,35 @@ def main() -> None:
     )
     block_size = args.block_size if args.block_size is not None else draft_model.block_size
 
+    # CO-TRAIN fix: the refiner was trained on the CO-TRAINED drafter's hidden states, so we MUST
+    # override the base z-lab drafter with the checkpoint's draft_state_dict (else the refiner sees
+    # off-distribution hidden -> accept is wrongly low). Frozen-refiner checkpoints have no
+    # draft_state_dict -> drafter stays at base z-lab (correct for those).
+    if args.refiner_path:
+        _ck = torch.load(args.refiner_path, map_location="cpu", weights_only=False)
+        if "draft_state_dict" in _ck:
+            _miss, _unexp = draft_model.load_state_dict(_ck["draft_state_dict"], strict=False)
+            print(f"[cotrain] OVERRODE drafter with co-trained draft_state_dict: "
+                  f"missing={len(_miss)} unexpected={len(_unexp)} (step={_ck.get('global_step')})")
+            if _miss:
+                print(f"[cotrain] WARNING drafter keys NOT loaded (stay at base z-lab): {list(_miss)[:8]}")
+        else:
+            print("[cotrain] checkpoint has NO draft_state_dict -> drafter stays at base z-lab (frozen-refiner ckpt).")
+        del _ck
+
     refiner = load_refiner(args.refiner_path, draft_model, device) if args.refiner_path else None
 
-    if args.lowrank_rank > 0 and refiner is not None:
-        if getattr(refiner, "lowrank_head", None) is None:
+    # --lowrank-rank is the master ON/OFF switch for the low-rank readout:
+    #   0   -> FULL lm_head baseline (disable any head, incl. one loaded from the checkpoint)
+    #   >0  -> low-rank readout: TRAINED head if the checkpoint has one (its rank, the flag only
+    #          turns it on); else POST-HOC SVD-init at this rank from lm_head (full-lm_head ckpts).
+    if refiner is not None:
+        if args.lowrank_rank <= 0:
+            if getattr(refiner, "lowrank_head", None) is not None:
+                refiner.lowrank_head = None
+                if dist.is_main():
+                    print("[lowrank] --lowrank-rank 0 -> FULL lm_head (checkpoint's low-rank head disabled)")
+        elif getattr(refiner, "lowrank_head", None) is None:
             # full-lm_head checkpoint -> attach a POST-HOC SVD low-rank head (untrained approximation).
             H = draft_model.config.hidden_size
             V = target.lm_head.weight.shape[0]
@@ -370,7 +395,8 @@ def main() -> None:
                 print(f"[lowrank] POST-HOC SVD low-rank readout (rank {args.lowrank_rank}) from lm_head "
                       f"(untrained -> expect some accept drop)")
         elif dist.is_main():
-            print(f"[lowrank] using TRAINED low-rank head from checkpoint")
+            r = refiner.lowrank_head.up.weight.shape[1]
+            print(f"[lowrank] using TRAINED low-rank head from checkpoint (rank {r}; flag only enables it)")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
