@@ -58,6 +58,11 @@ class OnlineDFlashRefinerCoTrain(OnlineDFlashRefiner):
     """
 
     def __init__(self, *args, **kwargs):
+        # 2-point consistency: weight on the EXTRA loss term that conditions the refiner on the
+        # drafter's SEED prev (what the first Jacobi pass actually sees at inference) instead of the
+        # ground-truth prev. Closes the teacher-forcing vs inference gap -> Jacobi converges in
+        # fewer passes. 0 = off (default; existing recipes unchanged).
+        self.consistency_weight = float(kwargs.pop("consistency_weight", 0.0))
         super().__init__(*args, **kwargs)
         n = 0
         for p in self.feature_extractor.draft_model.parameters():
@@ -127,6 +132,26 @@ class OnlineDFlashRefinerCoTrain(OnlineDFlashRefiner):
         refined_loss = (F.cross_entropy(refined_logits, flat_tgt, reduction="none") * flat_w).sum() / denom
         base_loss = (F.cross_entropy(base_logits, flat_tgt, reduction="none") * flat_w).sum() / denom
         loss = (1.0 - lambda_base) * refined_loss + lambda_base * base_loss
+
+        # --- 2-point consistency: refine ALSO from the drafter's SEED prev (= the first Jacobi pass's
+        #     real input at inference), targeting the SAME gt. Trains the refiner to correct an
+        #     imperfect prev in ONE pass -> fewer inference passes. Costs one extra refiner+lm_head. ---
+        if self.consistency_weight > 0:
+            seed = base_3d.argmax(dim=-1).detach()             # (BN, block) drafter argmax per position
+            prev_seed = prev_tok.clone()
+            # slots 0,1 (tok_am1, anchor) stay correct; slots 2..block-1 <- drafter's predicted prev
+            prev_seed[:, 2:] = seed[:, 1:block - 1]
+            prev_seed_emb = fe.embed_tokens(prev_seed)
+            if self.refiner.lowrank_head is not None:
+                refined_s, corr_s = self.refiner(
+                    h, g, prev_seed_emb, window_hidden, window_mask, return_correction=True
+                )
+                seed_logits = (base_3d + corr_s).reshape(-1, V)
+            else:
+                refined_s = self.refiner(h, g, prev_seed_emb, window_hidden, window_mask)
+                seed_logits = fe.lm_head(refined_s).reshape(-1, V)
+            seed_loss = (F.cross_entropy(seed_logits, flat_tgt, reduction="none") * flat_w).sum() / denom
+            loss = loss + self.consistency_weight * seed_loss
 
         with torch.no_grad():
             pred = refined_logits.argmax(dim=-1)
