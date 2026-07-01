@@ -381,36 +381,36 @@ def main():
 
     if dist.get_rank() == 0:
         os.makedirs(args.output_dir, exist_ok=True)
-        _logf = open(os.path.join(args.output_dir, "train.log"), "a", buffering=1)
+        # _logf = open(os.path.join(args.output_dir, "train.log"), "a", buffering=1)
 
-        class _Tee:
-            def __init__(self, *streams):
-                self.streams = streams
+        # class _Tee:
+        #     def __init__(self, *streams):
+        #         self.streams = streams
 
-            def write(self, msg):
-                for s in self.streams:
-                    s.write(msg)
-                    s.flush()
+        #     def write(self, msg):
+        #         for s in self.streams:
+        #             s.write(msg)
+        #             s.flush()
 
-            def flush(self):
-                for s in self.streams:
-                    s.flush()
+        #     def flush(self):
+        #         for s in self.streams:
+        #             s.flush()
 
-            def isatty(self):
-                # reflect the REAL underlying stream: wandb shows its progress bar when this
-                # runs in a terminal, and auto-suppresses it when output is piped to a file
-                # (where a dynamic \r/ANSI bar would just be log garbage). Without this method
-                # at all, wandb.init crashes with AttributeError on the _Tee.
-                return self.streams[0].isatty()
+        #     def isatty(self):
+        #         # reflect the REAL underlying stream: wandb shows its progress bar when this
+        #         # runs in a terminal, and auto-suppresses it when output is piped to a file
+        #         # (where a dynamic \r/ANSI bar would just be log garbage). Without this method
+        #         # at all, wandb.init crashes with AttributeError on the _Tee.
+        #         return self.streams[0].isatty()
 
-            def __getattr__(self, name):
-                # delegate anything else (fileno, encoding, buffer, ...) to the real stream
-                # so libraries probing the stream don't hit AttributeError.
-                return getattr(self.streams[0], name)
+        #     def __getattr__(self, name):
+        #         # delegate anything else (fileno, encoding, buffer, ...) to the real stream
+        #         # so libraries probing the stream don't hit AttributeError.
+        #         return getattr(self.streams[0], name)
 
-        sys.stdout = _Tee(sys.stdout, _logf)
-        sys.stderr = _Tee(sys.stderr, _logf)
-        print(f"[tee] logging to {os.path.join(args.output_dir, 'train.log')}")
+        # sys.stdout = _Tee(sys.stdout, _logf)
+        # sys.stderr = _Tee(sys.stderr, _logf)
+        # print(f"[tee] logging to {os.path.join(args.output_dir, 'train.log')}")
 
     # --- DFlash drafter (initialized from checkpoint, then CO-TRAINED) ---
     print_on_rank0(f"Loading DFlash drafter (to co-train) from {args.dflash_model_path}")
